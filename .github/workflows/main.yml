@@ -1,4 +1,4 @@
-name: AetherGrid AIO (TrueLive v13)
+name: AetherGrid AIO (BaseOverlay v14)
 
 on:
   workflow_dispatch:
@@ -24,7 +24,6 @@ jobs:
       - name: Install Minimal Stack
         run: |
           set -e
-          echo "[LOG] WHAT: INSTALL_START | WHEN: $(date +%s%N)"
           sudo apt-get update -y
           sudo apt-get remove -y rclone || true
           sudo apt-get install -y --no-install-recommends \
@@ -40,20 +39,19 @@ jobs:
           sleep 15
           echo "[LOG] WHAT: NETBIRD_UP | WHEN: $(date +%s%N)"
 
-      - name: RAM Cache Disk + FUSE Prep
+      - name: Journal RAM Disk (Bounded)
         run: |
           set -e
           sudo mkdir -p /ramdisk /mnt/drime
-          sudo mount -t tmpfs -o size=8G tmpfs /ramdisk
+          sudo mount -t tmpfs -o size=9G tmpfs /ramdisk
           sudo mkdir -p /ramdisk/cache
           sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
-          echo "[LOG] WHAT: CACHE_RAM_READY | CAP: 8G (cache only, NO iso copy) | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: JOURNAL_RAM_READY | CAP: 9G | WHEN: $(date +%s%N)"
 
-      - name: Build Drime Config (Accounts + Single Disk)
+      - name: Build Drime Config
         run: |
           set -e
-          CONF=/tmp/rclone.conf
-          : > $CONF
+          CONF=/tmp/rclone.conf; : > $CONF
           printf '[drime0]\ntype = drime\naccess_token = %s\n' "$DRIME" >> $CONF
           N=1; i=1
           for V in DRIME1 DRIME2 DRIME3; do
@@ -75,131 +73,112 @@ jobs:
           chmod 600 $CONF
           echo "REMOTE=$REMOTE" >> $GITHUB_ENV
           echo "ACCOUNTS=$N"    >> $GITHUB_ENV
-          echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | REMOTE: $REMOTE | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | WHEN: $(date +%s%N)"
 
-      - name: Mount Drime (LiveWrite Tuned)
+      - name: Mount Drime (Read-Optimized, No Dirty Wall)
         run: |
           set -e
           sudo rclone mount "${REMOTE}:" /mnt/drime \
             --config /tmp/rclone.conf \
             --vfs-cache-mode full \
-            --vfs-cache-max-size 6G \
-            --vfs-write-back 5s \
+            --vfs-cache-max-size 1500M \
             --vfs-read-ahead 256M \
-            --transfers 4 \
-            --multi-thread-streams 4 \
+            --transfers 4 --multi-thread-streams 4 \
             --cache-dir /ramdisk/cache \
-            --allow-other \
-            --log-level INFO \
-            --daemon
+            --allow-other --log-level INFO --daemon
           sleep 10
           mountpoint -q /mnt/drime && ls /mnt/drime >/dev/null 2>&1
-          if [ "$ACCOUNTS" -gt 1 ]; then
-            sudo mkdir -p /mnt/isostore
-            sudo rclone mount drime1: /mnt/isostore \
-              --config /tmp/rclone.conf \
-              --vfs-cache-mode full --vfs-cache-max-size 2G \
-              --vfs-write-back 5s --cache-dir /ramdisk/cache \
-              --allow-other --daemon
-            sleep 5
-            echo "ISOPATH=/mnt/isostore/ubuntu.iso" >> $GITHUB_ENV
-          else
-            echo "ISOPATH=/mnt/drime/ubuntu.iso" >> $GITHUB_ENV
-          fi
-          echo "[LOG] WHAT: DRIME_MOUNT_OK | LIVEWRITE: ON | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DRIME_MOUNT_OK | READ_LIVE: ON | WHEN: $(date +%s%N)"
 
       - name: Detect Mode + Self-Heal + Quota Choreography
         run: |
           set -e
           FORCE="${{ github.event.inputs.force_reinstall }}"
           if [ "$FORCE" = "true" ] && [ -f /mnt/drime/core.qcow2 ]; then
-            echo "[LOG] WHAT: SELF_HEAL | ACTION: wipe broken disk | WHEN: $(date +%s%N)"
             sudo rm -f /mnt/drime/core.qcow2
+            echo "[LOG] WHAT: SELF_HEAL | wiped base | WHEN: $(date +%s%N)"
           fi
-          # Stale ISO guard: never let ISO + 18G disk exceed 20G quota on 1 account
           if [ "$ACCOUNTS" -eq 1 ] && [ -f /mnt/drime/ubuntu.iso ] && [ -f /mnt/drime/core.qcow2 ]; then
-            echo "[LOG] WHAT: ISO_STALE_CLEANUP | WHY: protect quota on boot runs | WHEN: $(date +%s%N)"
             sudo rm -f /mnt/drime/ubuntu.iso
+            echo "[LOG] WHAT: ISO_STALE_CLEANUP | WHEN: $(date +%s%N)"
           fi
           if [ -f /mnt/drime/core.qcow2 ]; then
             MODE=BOOT
             SIZE=$((18*ACCOUNTS)); [ "$ACCOUNTS" -eq 1 ] || SIZE=$((18*ACCOUNTS-4))
-            echo "[LOG] WHAT: MODE_DETECT | MODE: REBOOT | CAP: ${SIZE}G | WHEN: $(date +%s%N)"
-            sudo qemu-img resize /mnt/drime/core.qcow2 "${SIZE}G" 2>/dev/null || \
-              echo "[LOG] WHAT: RESIZE_SKIP | WHY: same_or_smaller | WHEN: $(date +%s%N)"
+            sudo qemu-img resize /mnt/drime/core.qcow2 "${SIZE}G" 2>/dev/null || true
           else
             MODE=FIRST
             if [ "$ACCOUNTS" -eq 1 ]; then SIZE=16; else SIZE=$((18*ACCOUNTS-4)); fi
-            echo "[LOG] WHAT: MODE_DETECT | MODE: FIRST_BOOT | CAP: ${SIZE}G (ISO shares quota) | WHEN: $(date +%s%N)"
             sudo qemu-img create -f qcow2 /mnt/drime/core.qcow2 "${SIZE}G"
           fi
           echo "MODE=$MODE" >> $GITHUB_ENV
+          echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | BASE_CAP: ${SIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Stream ISO Directly To Drime (Zero RAM Copy)
+      - name: Stream ISO To Drime (First Boot Only)
         run: |
           set -e
           if [ "$MODE" = "FIRST" ]; then
-            if [ ! -f "$ISOPATH" ]; then
-              echo "[LOG] WHAT: ISO_STREAM_TO_DRIME | DEST: $ISOPATH | WHEN: $(date +%s%N)"
-              sudo wget -O "$ISOPATH" "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" || \
-              sudo wget -O "$ISOPATH" "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"
-            else
-              echo "[LOG] WHAT: ISO_REUSE | FROM: Drime | WHEN: $(date +%s%N)"
+            if [ ! -f /mnt/drime/ubuntu.iso ]; then
+              sudo wget -O /mnt/drime/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" || \
+              sudo wget -O /mnt/drime/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"
             fi
-            echo "CDROM=$ISOPATH" >> $GITHUB_ENV
-          else
-            echo "[LOG] WHAT: ISO_SKIPPED | WHY: OS installed | WHEN: $(date +%s%N)"
+            echo "CDROM=/mnt/drime/ubuntu.iso" >> $GITHUB_ENV
           fi
+          echo "[LOG] WHAT: ISO_READY | SOURCE: Drime | WHEN: $(date +%s%N)"
 
-      - name: Boot VM (CD From Drime / 16G / 2c4t / VNC 5900)
+      - name: Create Overlay Journal (Live Writes)
+        run: |
+          set -e
+          sudo qemu-img create -f qcow2 -b /mnt/drime/core.qcow2 -F qcow2 /ramdisk/overlay.qcow2 2>/dev/null || \
+          qemu-img create -f qcow2 -b /mnt/drime/core.qcow2 -F qcow2 /ramdisk/overlay.qcow2
+          echo "[LOG] WHAT: OVERLAY_JOURNAL_READY | TARGET: /ramdisk/overlay.qcow2 | WHEN: $(date +%s%N)"
+
+      - name: Boot VM (Base=Drime RO, Writes=Journal, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
-          ARGS="-m 16384 -smp 4,sockets=1,cores=2,threads=2 $ACC -vnc 0.0.0.0:0 -display none"
-          ARGS="$ARGS -drive file=/mnt/drime/core.qcow2,if=virtio,format=qcow2,cache=writeback,aio=threads"
-          if [ "$MODE" = "FIRST" ]; then
-            ARGS="$ARGS -boot order=dc -cdrom $CDROM"
-          else
-            ARGS="$ARGS -boot order=c"
-          fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | CD_SOURCE: Drime | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          if [ "$MODE" = "FIRST" ]; then GMEM=6144; else GMEM=12288; fi
+          ARGS="-m $GMEM -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
+          ARGS="$ARGS -drive file=/ramdisk/overlay.qcow2,if=virtio,format=qcow2,cache=writeback,aio=threads"
+          if [ "$MODE" = "FIRST" ]; then ARGS="$ARGS -boot order=dc -cdrom $CDROM"; else ARGS="$ARGS -boot order=c"; fi
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | GUEST_RAM: ${GMEM}M | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
 
           ( while true; do sleep 300; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
-            free -h | head -2 || true; df -h /ramdisk | tail -1 || true; \
-            sudo du -sh /ramdisk/cache 2>/dev/null | tail -1 || true; \
-            ls /mnt/drime >/dev/null 2>&1 || echo "[LOG] WHAT: DRIME_LINK_LOST | WHEN: $(date +%s%N)"; \
+            free -h | head -2 || true; \
+            OV=$(du -m /ramdisk/overlay.qcow2 2>/dev/null | cut -f1); echo "[LOG] WHAT: JOURNAL_SIZE | MB: $OV | WHEN: $(date +%s%N)"; \
+            [ "${OV:-0}" -gt 7000 ] && echo "[LOG] WHAT: JOURNAL_WARN | WHY: approaching RAM cap | WHEN: $(date +%s%N)"; \
           done ) &
           HB=$!
 
-          on_term() {
-            echo "[LOG] WHAT: SIGTERM_RECEIVED | ACTION: graceful_vm_shutdown | WHEN: $(date +%s%N)"
-            sudo pkill -TERM -f qemu-system-x86_64 || true
-            sleep 10
-            sudo pkill -KILL -f qemu-system-x86_64 || true
-          }
+          on_term() { echo "[LOG] WHAT: SIGTERM_RECEIVED | ACTION: graceful shutdown + commit | WHEN: $(date +%s%N)"; sudo pkill -TERM -f qemu-system-x86_64 || true; sleep 10; sudo pkill -KILL -f qemu-system-x86_64 || true; }
           trap on_term TERM INT
 
           sudo qemu-system-x86_64 $ARGS &
           QP=$!
-          EXIT=0
-          wait $QP || EXIT=$?
-          trap - TERM INT
-          kill $HB 2>/dev/null || true
-          echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
+          EXIT=0; wait $QP || EXIT=$?
+          trap - TERM INT; kill $HB 2>/dev/null || true
           echo "VMEXIT=$EXIT" >> $GITHUB_ENV
+          echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
           exit 0
 
-      - name: Post-Install ISO Cleanup + Flush (ALWAYS)
+      - name: COMMIT Journal To Drime (ALWAYS - Your Save Point)
         if: always()
         run: |
-          echo "[LOG] WHAT: POST_START | WHEN: $(date +%s%N)"
-          if [ "$MODE" = "FIRST" ] && [ "$VMEXIT" = "0" ] && [ "$ACCOUNTS" -eq 1 ]; then
-            echo "[LOG] WHAT: ISO_CLEANUP | WHY: install complete, free 3.2G quota, disk grows to 18G next run | WHEN: $(date +%s%N)"
-            sudo rm -f /mnt/drime/ubuntu.iso || true
-          fi
+          echo "[LOG] WHAT: COMMIT_START | WHY: flatten journal + stream to Drime | WHEN: $(date +%s%N)"
           sudo pkill -TERM -f qemu-system-x86_64 || true
           sleep 5
+          if [ -f /ramdisk/overlay.qcow2 ]; then
+            qemu-img convert -c -f qcow2 -O qcow2 /ramdisk/overlay.qcow2 /ramdisk/committed.qcow2 || true
+            if [ -f /ramdisk/committed.qcow2 ]; then
+              rclone copyto --config /tmp/rclone.conf /ramdisk/committed.qcow2 "${REMOTE}:core.qcow2" || \
+                sudo rclone copyto --config /tmp/rclone.conf /ramdisk/committed.qcow2 "${REMOTE}:core.qcow2"
+              echo "[LOG] WHAT: COMMIT_UPLOADED | DRIME_GREW: YES | WHEN: $(date +%s%N)"
+            fi
+          fi
+          if [ "$MODE" = "FIRST" ] && [ "$VMEXIT" = "0" ] && [ "$ACCOUNTS" -eq 1 ]; then
+            sudo rm -f /mnt/drime/ubuntu.iso || true
+            echo "[LOG] WHAT: ISO_CLEANUP | quota freed, base grows to 18G next run | WHEN: $(date +%s%N)"
+          fi
           sync || true
           sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
-          sudo umount /mnt/isostore 2>/dev/null || true
-          echo "[LOG] WHAT: FLUSH_DONE | DRIME_SAFE | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: COMMIT_DONE | DRIME_SAFE | WHEN: $(date +%s%N)"
