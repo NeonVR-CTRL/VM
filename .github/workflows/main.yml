@@ -1,4 +1,4 @@
-name: AetherGrid AIO (Smart Boot v11)
+name: VM
 
 on:
   workflow_dispatch:
