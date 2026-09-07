@@ -1,12 +1,17 @@
-name: VM
+name: AetherGrid AIO (Self-Heal v12)
 
 on:
   workflow_dispatch:
+    inputs:
+      force_reinstall:
+        description: 'Wipe broken disk and reinstall OS (true/false)'
+        required: false
+        default: 'false'
 
 jobs:
   boot-vm:
     runs-on: ubuntu-latest
-    timeout-minutes: 360 # 6 Hours Hard Limit
+    timeout-minutes: 360
 
     env:
       NB_SK:  ${{ secrets.NB_SK }}
@@ -16,7 +21,7 @@ jobs:
       DRIME3: ${{ secrets.DRIME3 }}
 
     steps:
-      - name: Install Minimal Stack (Headless QEMU + Latest Rclone + NetBird)
+      - name: Install Minimal Stack
         run: |
           set -e
           echo "[LOG] WHAT: INSTALL_START | WHEN: $(date +%s%N)"
@@ -43,9 +48,9 @@ jobs:
           sudo mount -t tmpfs -o size=6G tmpfs /ramdisk
           sudo mkdir -p /ramdisk/cache
           sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
-          echo "[LOG] WHAT: RAMDISK_READY | CAP: 6G (unused = 0 RAM) | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: RAMDISK_READY | WHEN: $(date +%s%N)"
 
-      - name: Build Drime Config (Auto-Detect Accounts + Single Disk)
+      - name: Build Drime Config (Auto Accounts + Single Disk)
         run: |
           set -e
           CONF=/tmp/rclone.conf
@@ -72,10 +77,9 @@ jobs:
           chmod 600 $CONF
           echo "REMOTE=$REMOTE"  >> $GITHUB_ENV
           echo "DISK_SIZE=$SIZE" >> $GITHUB_ENV
-          echo "ACCOUNTS=$N"     >> $GITHUB_ENV
-          echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | REMOTE: $REMOTE | SINGLE_DISK_CAP: ${SIZE}G | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | REMOTE: $REMOTE | CAP: ${SIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Mount Drime (Verified Active)
+      - name: Mount Drime (Verified)
         run: |
           set -e
           sudo rclone mount "${REMOTE}:" /mnt/drime \
@@ -88,39 +92,41 @@ jobs:
             --daemon
           sleep 10
           mountpoint -q /mnt/drime && ls /mnt/drime >/dev/null 2>&1
-          echo "[LOG] WHAT: DRIME_MOUNT_OK | REMOTE: $REMOTE | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DRIME_MOUNT_OK | WHEN: $(date +%s%N)"
 
-      - name: Detect Boot Mode + Prepare Single Disk
+      - name: Detect Mode + Self-Heal Broken Disk
         run: |
           set -e
+          FORCE="${{ github.event.inputs.force_reinstall }}"
+          if [ "$FORCE" = "true" ] && [ -f /mnt/drime/core.qcow2 ]; then
+            echo "[LOG] WHAT: SELF_HEAL | ACTION: wiping broken partial disk | WHEN: $(date +%s%N)"
+            sudo rm -f /mnt/drime/core.qcow2
+          fi
           if [ -f /mnt/drime/core.qcow2 ]; then
             MODE=BOOT
             echo "[LOG] WHAT: MODE_DETECT | MODE: REBOOT | ISO: SKIPPED | WHEN: $(date +%s%N)"
-            sudo qemu-img info /mnt/drime/core.qcow2 || true
             sudo qemu-img resize /mnt/drime/core.qcow2 "${DISK_SIZE}G" 2>/dev/null || \
-              echo "[LOG] WHAT: RESIZE_SKIP | WHY: same_or_smaller_size | WHEN: $(date +%s%N)"
+              echo "[LOG] WHAT: RESIZE_SKIP | WHY: same_or_smaller | WHEN: $(date +%s%N)"
           else
             MODE=FIRST
-            echo "[LOG] WHAT: MODE_DETECT | MODE: FIRST_BOOT | ISO: REQUIRED | WHEN: $(date +%s%N)"
+            echo "[LOG] WHAT: MODE_DETECT | MODE: FIRST_BOOT | WHEN: $(date +%s%N)"
             sudo qemu-img create -f qcow2 /mnt/drime/core.qcow2 "${DISK_SIZE}G"
           fi
           echo "MODE=$MODE" >> $GITHUB_ENV
 
-      - name: Download Ubuntu 26.04 ISO (FIRST BOOT ONLY)
+      - name: Download Ubuntu 26.04 ISO (First Boot Only)
         run: |
           set -e
           if [ "$MODE" = "FIRST" ]; then
-            echo "[LOG] WHAT: ISO_DOWNLOAD_START | WHICH: Ubuntu 26.04 LTS only | WHEN: $(date +%s%N)"
             wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" || \
             wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"
             echo "[LOG] WHAT: ISO_READY | WHEN: $(date +%s%N)"
           else
-            echo "[LOG] WHAT: ISO_DOWNLOAD_SKIPPED | WHY: OS already installed on Drime | WHEN: $(date +%s%N)"
+            echo "[LOG] WHAT: ISO_SKIPPED | WHY: OS installed | WHEN: $(date +%s%N)"
           fi
 
-      - name: Boot VM (16GB RAM / 2c4t / VNC 0.0.0.0:5900)
+      - name: Boot VM (16G / 2c4t / VNC 5900) + SIGTERM Trap
         run: |
-          set -e
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 16384 -smp 4,sockets=1,cores=2,threads=2 $ACC -vnc 0.0.0.0:0 -display none"
           ARGS="$ARGS -drive file=/mnt/drime/core.qcow2,if=virtio,format=qcow2,cache=writeback,aio=threads"
@@ -129,7 +135,7 @@ jobs:
           else
             ARGS="$ARGS -boot order=c"
           fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | RAM: 16G | CPU: 2c4t | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
 
           ( while true; do sleep 300; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
@@ -138,19 +144,29 @@ jobs:
           done ) &
           HB=$!
 
+          on_term() {
+            echo "[LOG] WHAT: SIGTERM_RECEIVED | WHY: external_cancel_or_runner_eviction | ACTION: graceful_vm_shutdown | WHEN: $(date +%s%N)"
+            sudo pkill -TERM -f qemu-system-x86_64 || true
+            sleep 10
+            sudo pkill -KILL -f qemu-system-x86_64 || true
+          }
+          trap on_term TERM INT
+
           sudo qemu-system-x86_64 $ARGS &
           QP=$!
           EXIT=0
           wait $QP || EXIT=$?
+          trap - TERM INT
           kill $HB 2>/dev/null || true
           echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
           exit $EXIT
 
-      - name: Flush Drime Cache (ALWAYS - Protects Your Data)
+      - name: Flush Drime Cache (ALWAYS)
         if: always()
         run: |
-          echo "[LOG] WHAT: FLUSH_START | WHY: VM closed, pushing dirty cache to Drime | WHEN: $(date +%s%N)"
-          sync || true
+          echo "[LOG] WHAT: FLUSH_START | WHEN: $(date +%s%N)"
+          sudo pkill -TERM -f qemu-system-x86_64 || true
           sleep 5
+          sync || true
           sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
           echo "[LOG] WHAT: FLUSH_DONE | DRIME_SAFE | WHEN: $(date +%s%N)"
