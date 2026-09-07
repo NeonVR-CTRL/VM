@@ -1,4 +1,4 @@
-name: VM
+name: AetherGrid AIO (Aether-Core v7)
 
 on:
   workflow_dispatch:
@@ -22,10 +22,9 @@ jobs:
           # Install Latest Rclone
           curl https://rclone.org/install.sh | sudo bash
 
-      - name: Install NetBird (The Fix)
+      - name: Install NetBird
         run: |
           echo "[LOG] WHAT: NETBIRD_INSTALL | WHICH: Official Script | WHEN: $(date +%s%N)"
-          # This script adds the repo AND installs NetBird automatically
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
 
       - name: Initialize NetBird Mesh
@@ -74,9 +73,15 @@ jobs:
             exit 1
           fi
 
-      - name: Download Ubuntu ISO to RAM (10,000% Faster than Network Read)
+      - name: Download Ubuntu 26.04 LTS ISO to RAM (Verified Mirrors)
         run: |
-          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"
+          # Primary: Ubuntu 26.04 LTS (Resolute Raccoon)
+          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" || \
+          # Fallback 1: Ubuntu 26.04.1 Point Release
+          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso" || \
+          # Fallback 2: Ubuntu 24.04.4 LTS (Noble Numbat)
+          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/noble/ubuntu-24.04.4-live-server-amd64.iso"
+          
           echo "[LOG] WHAT: ISO_READY | WHICH: /ramdisk/ubuntu.iso | WHEN: $(date +%s%N)"
 
       - name: Create Virtual Block Device (10GB)
