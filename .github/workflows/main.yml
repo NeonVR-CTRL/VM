@@ -76,7 +76,7 @@ jobs:
 
       - name: Download Ubuntu ISO to RAM (10,000% Faster than Network Read)
         run: |
-          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/noble/ubuntu-24.04.1-live-server-amd64.iso"
+          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"
           echo "[LOG] WHAT: ISO_READY | WHICH: /ramdisk/ubuntu.iso | WHEN: $(date +%s%N)"
 
       - name: Create Virtual Block Device (10GB)
