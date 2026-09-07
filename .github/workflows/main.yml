@@ -1,4 +1,4 @@
-name: AetherGrid AIO (Aether-Core v7)
+name: AetherGrid AIO (Turbo Edition)
 
 on:
   workflow_dispatch:
@@ -13,11 +13,19 @@ jobs:
       DRIME: ${{ secrets.DRIME }}
 
     steps:
-      - name: Install Core Stack (QEMU, Rclone)
+      - name: Install Minimal Core Stack (Turbo Mode)
         run: |
-          echo "[LOG] WHAT: STACK_INSTALL | WHICH: QEMU, Rclone | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: TURBO_INSTALL | WHICH: Headless QEMU + NetBird | WHEN: $(date +%s%N)"
           sudo apt-get update -y
-          sudo apt-get install -y qemu-system-x86 qemu-utils qemu-system-common fuse3
+          
+          # FIX: --no-install-recommends strips 300MB+ of useless GUI/Audio bloat
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-utils \
+            qemu-system-common \
+            fuse3 \
+            wget \
+            curl
           
           # Install Latest Rclone
           curl https://rclone.org/install.sh | sudo bash
@@ -73,16 +81,13 @@ jobs:
             exit 1
           fi
 
-      - name: Download Ubuntu 26.04 LTS ISO to RAM (Verified Mirrors)
+      - name: Download Ubuntu 26.04 LTS ISO (Strict)
         run: |
-          # Primary: Ubuntu 26.04 LTS (Resolute Raccoon)
+          # STRICT 26.04 LTS (Resolute Raccoon)
           wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" || \
-          # Fallback 1: Ubuntu 26.04.1 Point Release
-          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso" || \
-          # Fallback 2: Ubuntu 24.04.4 LTS (Noble Numbat)
-          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/noble/ubuntu-24.04.4-live-server-amd64.iso"
+          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"
           
-          echo "[LOG] WHAT: ISO_READY | WHICH: /ramdisk/ubuntu.iso | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: ISO_READY | WHICH: Ubuntu 26.04 LTS | WHEN: $(date +%s%N)"
 
       - name: Create Virtual Block Device (10GB)
         run: |
