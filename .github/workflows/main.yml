@@ -1,4 +1,4 @@
-name: AetherGrid AIO (Aether-Core v6)
+name: VM
 
 on:
   workflow_dispatch:
