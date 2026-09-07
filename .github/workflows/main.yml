@@ -1,48 +1,118 @@
-Skip to content
-NeonVR-CTRL
-VM
-Repository navigation
-Code
-Issues
-Pull requests
-Agents
-Actions
-Projects
-Wiki
-Security and quality
-Insights
-Settings
-AetherGrid Direct-Drime OS Boot (FIXED v3)
-AetherGrid Direct-Drime OS Boot (FIXED v3) #5
-All jobs
-Run details
-boot-iso
-failed now in 1m 27s
-Search logs
-0s
-39s
-No VM guests are running outdated hypervisor (qemu) binaries on this host.
-Error: install service: Init already exists: /etc/systemd/system/netbird.service
-NetBird service has already been loaded
-NetBird service has been started
-Installation has been finished. To connect, you need to run NetBird by executing the following command:
-netbird up
-[LOG] WHAT: NETBIRD_BINARY_INSTALLED | WHICH: NetBird Client | WHEN: 1788809956393168076
-10s
-Run echo "[LOG] WHAT: SECRET_INJECTION_SUCCESS | WHICH: NB_SK | VALUE: [REDACTED] | WHEN: $(date +%s%N)"
-[LOG] WHAT: SECRET_INJECTION_SUCCESS | WHICH: NB_SK | VALUE: [REDACTED] | WHEN: 1788809956416300651
-2026-09-07T19:39:16.434Z DEBG client/cmd/up.go:387: failed to get profile state for login hint: profile state file does not exist
-Connected
-[LOG] WHAT: P2P_TUNNEL_ESTABLISHED | WHICH: wt0 | WHEN: 1788809966419993596
-0s
-14s
-20s
-1s
-Run echo "[LOG] WHAT: SPARSE_IMAGE_CREATION | WHICH: /mnt/drime/ubuntu_root.img (100GB) | WHEN: $(date +%s%N)"
-[LOG] WHAT: SPARSE_IMAGE_CREATION | WHICH: /mnt/drime/ubuntu_root.img (100GB) | WHEN: 1788810000089911660
-Formatting '/mnt/drime/ubuntu_root.img', fmt=raw size=107374182400
-qemu-img: /mnt/drime/ubuntu_root.img: Could not create '/mnt/drime/ubuntu_root.img': Input/output error
-Error: Process completed with exit code 1.
-0s
-0s
-0s
+name: AetherGrid AIO (Aether-Core Edition)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  boot-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # 6 Hours Hard Limit
+
+    env:
+      NB_SK: ${{ secrets.NB_SK }}
+      DRIME: ${{ secrets.DRIME }}
+
+    steps:
+      - name: Install Core Stack (QEMU, NetBird, Rclone)
+        run: |
+          echo "[LOG] WHAT: STACK_INSTALL | WHICH: QEMU-Utils, NetBird, Rclone | WHEN: $(date +%s%N)"
+          sudo apt-get update -y
+          sudo apt-get install -y qemu-system-x86 qemu-utils qemu-system-common netbird
+          
+          # Install Latest Rclone
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Initialize NetBird Mesh
+        run: |
+          echo "[LOG] WHAT: NETBIRD_INIT | WHICH: $NB_SK | WHEN: $(date +%s%N)"
+          sudo netbird up --setup-key "$NB_SK" --log-level error &
+          sleep 15
+          echo "[LOG] WHAT: MESH_READY | WHICH: wt0 | WHEN: $(date +%s%N)"
+
+      - name: Create High-Performance RAM Disk
+        run: |
+          echo "[LOG] WHAT: RAM_DISK_ALLOC | WHICH: 14GB tmpfs | WHEN: $(date +%s%N)"
+          sudo mkdir -p /ramdisk
+          sudo mount -t tmpfs -o size=14G tmpfs /ramdisk
+          sudo mkdir -p /ramdisk/cache
+
+      - name: Generate Drime WebDAV Config (The "Universal" Fix)
+        run: |
+          # Drime uses WebDAV with Bearer Tokens. We generate the config dynamically.
+          cat <<EOF > /tmp/rclone.conf
+          [drime]
+          type = webdav
+          url = https://webdav.drime.cloud
+          vendor = other
+          bearer_token = $DRIME
+          EOF
+          echo "[LOG] WHAT: CONFIG_GENERATED | WHICH: WebDAV+Bearer | WHEN: $(date +%s%N)"
+
+      - name: Mount Drime (Zero-Copy Optimized)
+        run: |
+          sudo mkdir -p /mnt/drime
+          sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf
+          
+          # Mount with optimized VFS for User-Space NVMe
+          sudo rclone mount drime: /mnt/drime \
+            --config /tmp/rclone.conf \
+            --vfs-cache-mode full \
+            --vfs-cache-max-size 12G \
+            --cache-dir /ramdisk/cache \
+            --allow-other \
+            --daemon
+            
+          sleep 10
+          if mountpoint -q /mnt/drime; then
+            echo "[LOG] WHAT: DRIME_MOUNTED | WHICH: /mnt/drime | WHEN: $(date +%s%N)"
+          else
+            echo "[LOG] WHAT: MOUNT_FAILED | WHY: Check Token/URL | WHEN: $(date +%s%N)"
+            exit 1
+          fi
+
+      - name: Download Ubuntu ISO
+        run: |
+          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/noble/ubuntu-24.04.1-live-server-amd64.iso"
+          echo "[LOG] WHAT: ISO_READY | WHICH: /ramdisk/ubuntu.iso | WHEN: $(date +%s%N)"
+
+      - name: Create Virtual Block Device (10GB)
+        run: |
+          sudo qemu-img create -f raw /mnt/drime/core.img 10G
+          echo "[LOG] WHAT: BLOCK_DEV_CREATED | WHICH: /mnt/drime/core.img | WHEN: $(date +%s%N)"
+
+      - name: Launch User-Space NVMe Daemon (The "ARM" Innovation)
+        run: |
+          # This launches the storage daemon in User Space, bypassing kernel overhead
+          sudo qemu-storage-daemon \
+            --blockdev driver=file,node-name=disk0,filename=/mnt/drime/core.img,aio=threads \
+            --export type=vhost-user-blk,id=export0,node-name=disk0,addr.type=unix,addr.path=/tmp/vhost.sock &
+            
+          sleep 5
+          echo "[LOG] WHAT: NVME_DAEMON_ACTIVE | WHICH: /tmp/vhost.sock | WHEN: $(date +%s%N)"
+
+      - name: Boot QEMU VM (Aether-Core Mode)
+        run: |
+          # Connects directly to the User-Space NVMe socket
+          sudo qemu-system-x86_64 \
+            -m 8192 \
+            -smp 4 \
+            -accel kvm \
+            -cpu host \
+            -boot d \
+            -cdrom /ramdisk/ubuntu.iso \
+            -chardev socket,id=char0,path=/tmp/vhost.sock \
+            -device vhost-user-blk-pci,chardev=char0 \
+            -vnc 0.0.0.0:0 \
+            -display none \
+            -daemonize
+            
+          echo "[LOG] WHAT: VM_BOOTED | WHICH: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+
+      - name: 6-Hour Keep-Alive
+        run: |
+          for i in $(seq 1 21600); do
+            sleep 1
+            if [ $((i % 300)) -eq 0 ]; then
+              echo "[LOG] WHAT: HEARTBEAT | WHICH: Uptime $((i/60))m | WHEN: $(date +%s%N)"
+            fi
+          done
