@@ -1,4 +1,4 @@
-name: AetherGrid Direct-Drime OS Boot (FIXED)
+name: AetherGrid Direct-Drime OS Boot (FIXED v3)
 
 on:
   workflow_dispatch:
@@ -19,7 +19,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y qemu-system-x86 qemu-utils util-linux
           
-          # FORCE INSTALL LATEST RCLONE (Fixes "backend not found" error)
+          # FORCE INSTALL LATEST RCLONE
           curl https://rclone.org/install.sh | sudo bash
           
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
@@ -42,7 +42,6 @@ jobs:
       - name: Download Ubuntu 26.04 LTS ISO to RAM
         run: |
           echo "[LOG] WHAT: ISO_DOWNLOAD_STARTED | WHICH: Ubuntu 26.04 LTS | WHEN: $(date +%s%N)"
-          # Fallback to 24.04 if 26.04 URL is not live yet on mirrors
           wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso" || wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/noble/ubuntu-24.04.1-live-server-amd64.iso"
           echo "[LOG] WHAT: ISO_DOWNLOAD_COMPLETE | WHICH: /ramdisk/ubuntu.iso | WHEN: $(date +%s%N)"
 
@@ -50,16 +49,29 @@ jobs:
         run: |
           echo "[LOG] WHAT: DRIME_SECRET_LOADED | WHICH: DRIME | VALUE: [REDACTED] | WHEN: $(date +%s%N)"
           sudo mkdir -p /mnt/drime
-          # Mount Drime using the LATEST rclone binary. Cache strictly in RAM disk.
-          rclone mount :drime,token=${DRIME}: /mnt/drime --vfs-cache-mode writes --cache-dir /ramdisk/rclone_cache --allow-other --daemon
-          sleep 5
-          echo "[LOG] WHAT: DRIME_MOUNTED | WHICH: /mnt/drime | WHEN: $(date +%s%N)"
+          
+          # FIX: Enable FUSE permissions for --allow-other
+          sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf
+          
+          # FIX: Run in background with sudo (No --daemon flag)
+          sudo rclone mount :drime,token=${DRIME}: /mnt/drime --vfs-cache-mode writes --cache-dir /ramdisk/rclone_cache --allow-other --log-level INFO &
+          
+          # Wait for the mount to establish
+          sleep 15
+          
+          # Verify the mount is active
+          if mountpoint -q /mnt/drime; then
+            echo "[LOG] WHAT: DRIME_MOUNTED_SUCCESS | WHICH: /mnt/drime | WHEN: $(date +%s%N)"
+          else
+            echo "[LOG] WHAT: DRIME_MOUNT_FAILED | WHY: FUSE_ERROR | WHEN: $(date +%s%N)"
+            exit 1
+          fi
 
       - name: Create Direct Block Device on Drime
         run: |
           echo "[LOG] WHAT: SPARSE_IMAGE_CREATION | WHICH: /mnt/drime/ubuntu_root.img (100GB) | WHEN: $(date +%s%N)"
           # Create a 100GB sparse file directly on the Drime mount
-          qemu-img create -f raw /mnt/drime/ubuntu_root.img 100G
+          sudo qemu-img create -f raw /mnt/drime/ubuntu_root.img 100G
           
           # Map it to a loop device so QEMU sees it as a real physical hard drive (/dev/sda)
           sudo losetup -fP /mnt/drime/ubuntu_root.img
@@ -72,10 +84,6 @@ jobs:
           echo "[LOG] WHAT: QEMU_BOOT_INITIATED | WHICH: Ubuntu ISO + Drime Block Device | WHEN: $(date +%s%N)"
           
           # Launch QEMU
-          # -m 12288 (12GB RAM for VM, leaves 4GB for host/RAM disk)
-          # -smp 4 (Uses all 4 threads)
-          # -hda $LOOP_DEV (Installs OS directly to Drime)
-          # -vnc 0.0.0.0:0 (Binds to 0.0.0.0:5900)
           sudo qemu-system-x86_64 \
             -m 12288 \
             -smp 4 \
