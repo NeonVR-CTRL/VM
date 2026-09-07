@@ -1,4 +1,4 @@
-name: AetherGrid Direct-Drime OS Boot
+name: AetherGrid Direct-Drime OS Boot v2
 
 on:
   workflow_dispatch:
@@ -13,13 +13,23 @@ jobs:
       DRIME: ${{ secrets.DRIME }}
 
     steps:
-      - name: Install Core Dependencies (QEMU, Rclone, NetBird)
+      - name: Install Core Dependencies & Latest Rclone
         run: |
-          echo "[LOG] WHAT: DEPENDENCY_INSTALL_STARTED | WHICH: QEMU, Rclone, NetBird | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DEPENDENCY_INSTALL_STARTED | WHICH: QEMU, NetBird | WHEN: $(date +%s%N)"
           sudo apt-get update -y
-          sudo apt-get install -y qemu-system-x86 qemu-utils rclone util-linux
+          sudo apt-get install -y qemu-system-x86 qemu-utils util-linux unzip
+          
+          # Install NetBird
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
-          echo "[LOG] WHAT: NETBIRD_BINARY_INSTALLED | WHICH: NetBird Client | WHEN: $(date +%s%N)"
+          
+          # Install LATEST Rclone (Fixes "didn't find backend called drime")
+          echo "[LOG] WHAT: RCLONE_LATEST_INSTALL | WHICH: Official Binary | WHEN: $(date +%s%N)"
+          curl -O https://downloads.rclone.org/current/rclone-current-linux-amd64.zip
+          unzip rclone-current-linux-amd64.zip
+          sudo cp rclone-*/rclone /usr/bin/
+          sudo chmod +x /usr/bin/rclone
+          rm -rf rclone-*
+          rclone version
 
       - name: Initialize NetBird Mesh (Via NB_SK)
         run: |
@@ -41,12 +51,22 @@ jobs:
           wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso" || wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/noble/ubuntu-24.04.1-live-server-amd64.iso"
           echo "[LOG] WHAT: ISO_DOWNLOAD_COMPLETE | WHICH: /ramdisk/ubuntu.iso | WHEN: $(date +%s%N)"
 
-      - name: Mount Drime Direct (Zero Local Storage)
+      - name: Configure & Mount Drime Direct (Zero Local Storage)
         run: |
           echo "[LOG] WHAT: DRIME_SECRET_LOADED | WHICH: DRIME | VALUE: [REDACTED] | WHEN: $(date +%s%N)"
+          
+          # Create Rclone Config explicitly for the latest backend
+          mkdir -p ~/.config/rclone/
+          cat <<EOF > ~/.config/rclone/rclone.conf
+[drime]
+type = drime
+token = ${DRIME}
+EOF
+          echo "[LOG] WHAT: RCLONE_CONFIG_CREATED | WHICH: drime | WHEN: $(date +%s%N)"
+
           sudo mkdir -p /mnt/drime
           # Mount Drime. Cache is strictly in RAM disk to prevent local disk usage.
-          rclone mount :drime,token=${DRIME}: /mnt/drime --vfs-cache-mode writes --cache-dir /ramdisk/rclone_cache --allow-other --daemon
+          rclone mount drime: /mnt/drime --vfs-cache-mode writes --cache-dir /ramdisk/rclone_cache --allow-other --daemon
           sleep 5
           echo "[LOG] WHAT: DRIME_MOUNTED | WHICH: /mnt/drime | WHEN: $(date +%s%N)"
 
@@ -67,10 +87,6 @@ jobs:
           echo "[LOG] WHAT: QEMU_BOOT_INITIATED | WHICH: Ubuntu ISO + Drime Block Device | WHEN: $(date +%s%N)"
           
           # Launch QEMU
-          # -m 12288 (12GB RAM for VM, leaves 4GB for host/RAM disk)
-          # -smp 4 (Uses all 4 threads)
-          # -hda $LOOP_DEV (Installs OS directly to Drime)
-          # -vnc 0.0.0.0:0 (Binds to 0.0.0.0:5900)
           sudo qemu-system-x86_64 \
             -m 12288 \
             -smp 4 \
