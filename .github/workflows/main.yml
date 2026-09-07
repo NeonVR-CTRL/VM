@@ -1,4 +1,4 @@
-name: AetherGrid AIO Drime VM v9
+name: AetherGrid AIO Drime VM v10
 
 on:
   workflow_dispatch:
@@ -61,24 +61,22 @@ jobs:
 
           df -h /ramdisk
 
-      - name: Create Drime Rclone Config
+      - name: Create Native Drime Rclone Config (THE FIX)
         run: |
           set -e
-          echo "[LOG] WHAT: DRIME_CONFIG_CREATE | WHICH: WebDAV Bearer Token | VALUE: REDACTED | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DRIME_CONFIG_CREATE | WHICH: Native Drime Backend | VALUE: REDACTED | WHEN: $(date +%s%N)"
 
           cat > /tmp/rclone.conf <<EOF
-          [drime]
-          type = webdav
-          url = https://webdav.drime.cloud
-          vendor = other
-          bearer_token = ${DRIME}
-          EOF
+[drime]
+type = drime
+access_token = ${DRIME}
+EOF
 
           chmod 600 /tmp/rclone.conf
 
           echo "[LOG] WHAT: DRIME_CONFIG_READY | WHEN: $(date +%s%N)"
 
-      - name: Mount Drime
+      - name: Mount Drime & Verify I/O
         run: |
           set -e
           echo "[LOG] WHAT: DRIME_MOUNT_START | WHICH: /mnt/drime | WHEN: $(date +%s%N)"
@@ -108,16 +106,21 @@ jobs:
             exit 1
           fi
 
-          echo "[LOG] WHAT: DRIME_LIST_TEST | WHEN: $(date +%s%N)"
-          ls -la /mnt/drime || true
+          echo "[LOG] WHAT: DRIME_IO_TEST | WHEN: $(date +%s%N)"
+          # Test writing a small file to verify I/O works before proceeding
+          echo "AETHER_TEST" | sudo tee /mnt/drime/test.txt || { echo "[LOG] WHAT: DRIME_IO_FAILED | WHY: write_test_failed | WHEN: $(date +%s%N)"; exit 1; }
+          sudo rm /mnt/drime/test.txt || true
+          echo "[LOG] WHAT: DRIME_IO_SUCCESS | WHEN: $(date +%s%N)"
 
       - name: Download Ubuntu 26.04 LTS ISO Only
         run: |
           set -e
           echo "[LOG] WHAT: ISO_DOWNLOAD_START | WHICH: Ubuntu 26.04 LTS only | WHEN: $(date +%s%N)"
 
-          wget -O /ramdisk/ubuntu-26.04.iso \
-            "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"
+          # Strict 26.04 LTS only. Tries base 26.04, then 26.04.1 point release.
+          wget -O /ramdisk/ubuntu-26.04.iso "https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso" || \
+          wget -O /ramdisk/ubuntu-26.04.iso "https://releases.ubuntu.com/26.04.1/ubuntu-26.04.1-live-server-amd64.iso" || \
+          wget -O /ramdisk/ubuntu-26.04.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"
 
           echo "[LOG] WHAT: ISO_DOWNLOAD_DONE | WHICH: /ramdisk/ubuntu-26.04.iso | WHEN: $(date +%s%N)"
 
@@ -127,18 +130,17 @@ jobs:
       - name: Create Drime QCOW2 Disk
         run: |
           set -e
-          echo "[LOG] WHAT: QCOW2_CREATE_START | WHICH: /mnt/drime/core.qcow2 8G | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: QCOW2_CREATE_START | WHICH: /mnt/drime/core.qcow2 10G | WHEN: $(date +%s%N)"
 
           if [ ! -f /mnt/drime/core.qcow2 ]; then
-            sudo qemu-img create -f qcow2 /mnt/drime/core.qcow2 8G
-            echo "[LOG] WHAT: QCOW2_CREATED | WHICH: new 8G virtual disk | WHEN: $(date +%s%N)"
+            sudo qemu-img create -f qcow2 /mnt/drime/core.qcow2 10G
+            echo "[LOG] WHAT: QCOW2_CREATED | WHICH: new 10G virtual disk | WHEN: $(date +%s%N)"
           else
             echo "[LOG] WHAT: QCOW2_EXISTS | WHICH: reusing existing /mnt/drime/core.qcow2 | WHEN: $(date +%s%N)"
           fi
 
           sudo qemu-img info /mnt/drime/core.qcow2 || true
           ls -lh /mnt/drime/core.qcow2 || true
-          df -h /ramdisk
 
       - name: Boot VM With VNC 0.0.0.0:5900
         run: |
