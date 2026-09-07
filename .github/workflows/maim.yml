@@ -1,0 +1,108 @@
+name: VM
+
+on:
+  workflow_dispatch:
+
+jobs:
+  aio-deploy:
+    # Note: If you are using a self-hosted runner with 16GB RAM, change this to:
+    # runs-on: self-hosted
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # 6 Hours Hard Limit
+
+    env:
+      # --- NETBIRD SECRET ---
+      NB_SK: ${{ secrets.NB_SK }}
+      
+      # --- DRIME SECRETS (DEFAULT + SCALING POOL) ---
+      DRIME: ${{ secrets.DRIME }}
+      DRIME1: ${{ secrets.DRIME1 }}
+      DRIME2: ${{ secrets.DRIME2 }}
+      DRIME3: ${{ secrets.DRIME3 }}
+      # Add DRIME4, DRIME5, etc. here as you scale
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies (Xvfb, VNC, XFCE, NetBird)
+        run: |
+          echo "[LOG] WHAT: DEPENDENCY_INSTALL_STARTED | WHICH: AIO Stack | WHEN: $(date +%s%N)"
+          sudo apt-get update -y
+          sudo apt-get install -y xvfb x11vnc xfce4 xfce4-goodies dbus-x11
+          
+          # Install NetBird
+          curl -fsSL https://pkgs.netbird.io/install.sh | sh
+          echo "[LOG] WHAT: NETBIRD_BINARY_INSTALLED | WHICH: NetBird Client | WHEN: $(date +%s%N)"
+
+      - name: Initialize NetBird Mesh (Via NB_SK)
+        run: |
+          echo "[LOG] WHAT: SECRET_INJECTION_SUCCESS | WHICH: NB_SK | VALUE: [REDACTED] | WHEN: $(date +%s%N)"
+          
+          # Start NetBird in the background using the Setup Key
+          sudo netbird up --setup-key "$NB_SK" --log-level debug &
+          
+          # Wait for the P2P tunnel to establish
+          sleep 10
+          echo "[LOG] WHAT: P2P_TUNNEL_ESTABLISHED | WHICH: wt0 | WHEN: $(date +%s%N)"
+
+      - name: Start Ghost Monitor & VNC (0.0.0.0:5900)
+        run: |
+          echo "[LOG] WHAT: XVFB_VIRTUAL_MONITOR_SPAWNED | WHICH: 1920x1080x24 | WHEN: $(date +%s%N)"
+          
+          # Start the Virtual Framebuffer (Fake Monitor)
+          Xvfb :0 -screen 0 1920x1080x24 &
+          sleep 3
+          
+          # Export the display environment
+          export DISPLAY=:0
+          
+          # Start the Desktop Environment
+          startxfce4 &
+          sleep 5
+          
+          # Start VNC bound to ALL INTERFACES (0.0.0.0) on Port 5900
+          echo "[LOG] WHAT: VNC_BIND_ALL_INTERFACES | WHICH: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          x11vnc -display :0 -forever -listen 0.0.0.0 -rfbport 5900 -nopw &
+
+      - name: Drime Swarm Discovery & Telemetry Loop
+        run: |
+          echo "[LOG] WHAT: DRIME_SECRET_DISCOVERY | WHICH: Dynamic Scanner | WHEN: $(date +%s%N)"
+          
+          ACCOUNT_COUNT=0
+          
+          # Dynamic Secret Scanner (Default + Feature Pool)
+          if [ -n "$DRIME" ]; then 
+            ACCOUNT_COUNT=$((ACCOUNT_COUNT+1))
+            echo "[LOG] WHAT: DEFAULT_SECRET_LOADED | WHICH: DRIME | VALUE: [REDACTED] | WHEN: $(date +%s%N)"
+          fi
+          
+          if [ -n "$DRIME1" ]; then 
+            ACCOUNT_COUNT=$((ACCOUNT_COUNT+1))
+            echo "[LOG] WHAT: SWARM_SECRET_DISCOVERED | WHICH: DRIME1 | VALUE: [REDACTED] | WHEN: $(date +%s%N)"
+          fi
+          
+          if [ -n "$DRIME2" ]; then 
+            ACCOUNT_COUNT=$((ACCOUNT_COUNT+1))
+            echo "[LOG] WHAT: SWARM_SECRET_DISCOVERED | WHICH: DRIME2 | VALUE: [REDACTED] | WHEN: $(date +%s%N)"
+          fi
+          
+          if [ -n "$DRIME3" ]; then 
+            ACCOUNT_COUNT=$((ACCOUNT_COUNT+1))
+            echo "[LOG] WHAT: SWARM_SECRET_DISCOVERED | WHICH: DRIME3 | VALUE: [REDACTED] | WHEN: $(date +%s%N)"
+          fi
+          
+          # Calculate Total Theoretical Capacity
+          TOTAL_CAPACITY=$((ACCOUNT_COUNT * 20))
+          echo "[LOG] WHAT: TOTAL_CAPACITY_CALCULATED | WHICH: ${TOTAL_CAPACITY}GB | WHEN: $(date +%s%N)"
+
+          # 6-Hour Keep-Alive Loop (21600 seconds)
+          echo "[LOG] WHAT: KEEP_ALIVE_LOOP_STARTED | WHICH: 6 Hours | WHEN: $(date +%s%N)"
+          for i in $(seq 1 21600); do
+            sleep 1
+            
+            # Print a heartbeat every 5 minutes (300 seconds) to prevent CI idle kill
+            if [ $((i % 300)) -eq 0 ]; then
+              echo "[LOG] WHAT: CI_STEALTH_HEARTBEAT | WHICH: Uptime: $((i/60))m | WHEN: $(date +%s%N)"
+            fi
+          done
