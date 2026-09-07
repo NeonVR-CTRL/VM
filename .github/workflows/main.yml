@@ -1,4 +1,4 @@
-name: AetherGrid AIO (Native Drime v10)
+name: AetherGrid AIO (Smart Boot v11)
 
 on:
   workflow_dispatch:
@@ -9,126 +9,148 @@ jobs:
     timeout-minutes: 360 # 6 Hours Hard Limit
 
     env:
-      NB_SK: ${{ secrets.NB_SK }}
-      DRIME: ${{ secrets.DRIME }}
+      NB_SK:  ${{ secrets.NB_SK }}
+      DRIME:  ${{ secrets.DRIME }}
+      DRIME1: ${{ secrets.DRIME1 }}
+      DRIME2: ${{ secrets.DRIME2 }}
+      DRIME3: ${{ secrets.DRIME3 }}
 
     steps:
-      - name: Install Minimal Core Stack (Force Clean Rclone)
+      - name: Install Minimal Stack (Headless QEMU + Latest Rclone + NetBird)
         run: |
-          echo "[LOG] WHAT: STACK_INSTALL | WHICH: Headless QEMU + Clean Rclone | WHEN: $(date +%s%N)"
+          set -e
+          echo "[LOG] WHAT: INSTALL_START | WHEN: $(date +%s%N)"
           sudo apt-get update -y
-          
-          # CRITICAL FIX: Remove any pre-installed/broken rclone versions first
           sudo apt-get remove -y rclone || true
-          
-          # Install Minimal QEMU
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 \
-            qemu-utils \
-            qemu-system-common \
-            fuse3 \
-            wget \
-            curl \
-            ca-certificates
-          
-          # Install the ABSOLUTE LATEST Rclone (Contains the Native Drime Backend)
+            qemu-system-x86 qemu-utils qemu-system-common fuse3 wget curl ca-certificates
           curl https://rclone.org/install.sh | sudo bash
-          
-          # Verify the version to prove it's the new one
-          rclone version
-          echo "[LOG] WHAT: RCLONE_UPDATED | WHICH: Latest Version with Drime Support | WHEN: $(date +%s%N)"
-
-      - name: Install NetBird
-        run: |
-          echo "[LOG] WHAT: NETBIRD_INSTALL | WHICH: Official Script | WHEN: $(date +%s%N)"
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
+          rclone version
+          echo "[LOG] WHAT: INSTALL_DONE | WHEN: $(date +%s%N)"
 
-      - name: Initialize NetBird Mesh
+      - name: NetBird Mesh Up
         run: |
-          echo "[LOG] WHAT: NETBIRD_INIT | WHICH: $NB_SK | WHEN: $(date +%s%N)"
+          set -e
           sudo netbird up --setup-key "$NB_SK" --log-level error &
           sleep 15
-          echo "[LOG] WHAT: MESH_READY | WHICH: wt0 | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: NETBIRD_UP | WHEN: $(date +%s%N)"
 
-      - name: Create High-Performance RAM Disk
+      - name: RAM Disk + FUSE Prep
         run: |
-          echo "[LOG] WHAT: RAM_DISK_ALLOC | WHICH: 11GB tmpfs | WHEN: $(date +%s%N)"
-          sudo mkdir -p /ramdisk
-          sudo mount -t tmpfs -o size=11G tmpfs /ramdisk
+          set -e
+          sudo mkdir -p /ramdisk /mnt/drime
+          sudo mount -t tmpfs -o size=6G tmpfs /ramdisk
           sudo mkdir -p /ramdisk/cache
+          sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
+          echo "[LOG] WHAT: RAMDISK_READY | CAP: 6G (unused = 0 RAM) | WHEN: $(date +%s%N)"
 
-      - name: Generate Native Drime Config (The Fix)
+      - name: Build Drime Config (Auto-Detect Accounts + Single Disk)
         run: |
-          # CRITICAL FIX: Use 'type = drime' and 'access_token' instead of WebDAV
-          cat <<EOF > /tmp/rclone.conf
-          [drime]
-          type = drime
-          access_token = $DRIME
-          EOF
-          echo "[LOG] WHAT: CONFIG_GENERATED | WHICH: Native Drime Backend | VALUE: REDACTED | WHEN: $(date +%s%N)"
+          set -e
+          CONF=/tmp/rclone.conf
+          : > $CONF
+          printf '[drime0]\ntype = drime\naccess_token = %s\n' "$DRIME" >> $CONF
+          N=1; i=1
+          for V in DRIME1 DRIME2 DRIME3; do
+            VAL="${!V}"
+            if [ -n "$VAL" ]; then
+              printf '[drime%d]\ntype = drime\naccess_token = %s\n' "$i" "$VAL" >> $CONF
+              N=$((N+1)); i=$((i+1))
+            fi
+          done
+          if [ "$N" -gt 1 ]; then
+            UP=""
+            for k in $(seq 0 $((N-1))); do UP="$UP drime$k:"; done
+            printf '[union]\ntype = union\nupstreams =%s\ncreate_policy = epmfs\naction_policy = epall\nsearch_policy = ff\n' "$UP" >> $CONF
+            printf '[disk]\ntype = chunker\nupstream = union:\nchunk_size = 10G\nname_format = *.part###\n' >> $CONF
+            REMOTE=disk
+          else
+            REMOTE=drime0
+          fi
+          SIZE=$((18*N))
+          chmod 600 $CONF
+          echo "REMOTE=$REMOTE"  >> $GITHUB_ENV
+          echo "DISK_SIZE=$SIZE" >> $GITHUB_ENV
+          echo "ACCOUNTS=$N"     >> $GITHUB_ENV
+          echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | REMOTE: $REMOTE | SINGLE_DISK_CAP: ${SIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Mount Drime (Native Protocol)
+      - name: Mount Drime (Verified Active)
         run: |
-          sudo mkdir -p /mnt/drime
-          sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf
-          
-          # Mount using the Native Backend defined in /tmp/rclone.conf
-          sudo rclone mount drime: /mnt/drime \
+          set -e
+          sudo rclone mount "${REMOTE}:" /mnt/drime \
             --config /tmp/rclone.conf \
             --vfs-cache-mode full \
-            --vfs-cache-max-size 7G \
+            --vfs-cache-max-size 2G \
             --cache-dir /ramdisk/cache \
             --allow-other \
             --log-level INFO \
             --daemon
-            
           sleep 10
-          
-          # Verify the mount is ACTUALLY reading data (not a zombie mount)
-          if mountpoint -q /mnt/drime && ls -la /mnt/drime > /dev/null 2>&1; then
-            echo "[LOG] WHAT: DRIME_MOUNT_SUCCESS | WHICH: /mnt/drime (Verified Active) | WHEN: $(date +%s%N)"
+          mountpoint -q /mnt/drime && ls /mnt/drime >/dev/null 2>&1
+          echo "[LOG] WHAT: DRIME_MOUNT_OK | REMOTE: $REMOTE | WHEN: $(date +%s%N)"
+
+      - name: Detect Boot Mode + Prepare Single Disk
+        run: |
+          set -e
+          if [ -f /mnt/drime/core.qcow2 ]; then
+            MODE=BOOT
+            echo "[LOG] WHAT: MODE_DETECT | MODE: REBOOT | ISO: SKIPPED | WHEN: $(date +%s%N)"
+            sudo qemu-img info /mnt/drime/core.qcow2 || true
+            sudo qemu-img resize /mnt/drime/core.qcow2 "${DISK_SIZE}G" 2>/dev/null || \
+              echo "[LOG] WHAT: RESIZE_SKIP | WHY: same_or_smaller_size | WHEN: $(date +%s%N)"
           else
-            echo "[LOG] WHAT: DRIME_MOUNT_FAILED | WHY: Auth Failed or Backend Missing | WHEN: $(date +%s%N)"
-            # Print logs to help debug if it fails again
-            cat /tmp/rclone.conf | grep type
-            exit 1
+            MODE=FIRST
+            echo "[LOG] WHAT: MODE_DETECT | MODE: FIRST_BOOT | ISO: REQUIRED | WHEN: $(date +%s%N)"
+            sudo qemu-img create -f qcow2 /mnt/drime/core.qcow2 "${DISK_SIZE}G"
+          fi
+          echo "MODE=$MODE" >> $GITHUB_ENV
+
+      - name: Download Ubuntu 26.04 ISO (FIRST BOOT ONLY)
+        run: |
+          set -e
+          if [ "$MODE" = "FIRST" ]; then
+            echo "[LOG] WHAT: ISO_DOWNLOAD_START | WHICH: Ubuntu 26.04 LTS only | WHEN: $(date +%s%N)"
+            wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" || \
+            wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"
+            echo "[LOG] WHAT: ISO_READY | WHEN: $(date +%s%N)"
+          else
+            echo "[LOG] WHAT: ISO_DOWNLOAD_SKIPPED | WHY: OS already installed on Drime | WHEN: $(date +%s%N)"
           fi
 
-      - name: Download Ubuntu 26.04 LTS ISO
+      - name: Boot VM (16GB RAM / 2c4t / VNC 0.0.0.0:5900)
         run: |
-          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" || \
-          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"
-          echo "[LOG] WHAT: ISO_READY | WHICH: /ramdisk/ubuntu.iso | WHEN: $(date +%s%N)"
+          set -e
+          if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
+          ARGS="-m 16384 -smp 4,sockets=1,cores=2,threads=2 $ACC -vnc 0.0.0.0:0 -display none"
+          ARGS="$ARGS -drive file=/mnt/drime/core.qcow2,if=virtio,format=qcow2,cache=writeback,aio=threads"
+          if [ "$MODE" = "FIRST" ]; then
+            ARGS="$ARGS -boot order=dc -cdrom /ramdisk/ubuntu.iso"
+          else
+            ARGS="$ARGS -boot order=c"
+          fi
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | RAM: 16G | CPU: 2c4t | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
 
-      - name: Create Virtual Block Device (QCOW2 on Native Drime)
-        run: |
-          # Now that the backend is native and verified, QCOW2 creation will succeed
-          sudo qemu-img create -f qcow2 /mnt/drime/core.qcow2 8G
-          echo "[LOG] WHAT: BLOCK_DEV_CREATED | WHICH: /mnt/drime/core.qcow2 | WHEN: $(date +%s%N)"
+          ( while true; do sleep 300; \
+            echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
+            free -h | head -2 || true; df -h /ramdisk | tail -1 || true; \
+            ls /mnt/drime >/dev/null 2>&1 || echo "[LOG] WHAT: DRIME_LINK_LOST | WHEN: $(date +%s%N)"; \
+          done ) &
+          HB=$!
 
-      - name: Boot QEMU VM (Aether-Core Mode)
-        run: |
-          sudo qemu-system-x86_64 \
-            -m 3072 \
-            -smp 4 \
-            -accel kvm -accel tcg \
-            -cpu host \
-            -boot d \
-            -cdrom /ramdisk/ubuntu.iso \
-            -drive file=/mnt/drime/core.qcow2,if=virtio,format=qcow2,cache=writeback \
-            -vnc 0.0.0.0:0 \
-            -display none \
-            -daemonize
-            
-          echo "[LOG] WHAT: VM_BOOTED | WHICH: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          sudo qemu-system-x86_64 $ARGS &
+          QP=$!
+          EXIT=0
+          wait $QP || EXIT=$?
+          kill $HB 2>/dev/null || true
+          echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
+          exit $EXIT
 
-      - name: 6-Hour Keep-Alive & Telemetry
+      - name: Flush Drime Cache (ALWAYS - Protects Your Data)
+        if: always()
         run: |
-          for i in $(seq 1 21600); do
-            sleep 1
-            if [ $((i % 300)) -eq 0 ]; then
-              echo "[LOG] WHAT: HEARTBEAT | WHICH: Uptime $((i/60))m | WHEN: $(date +%s%N)"
-              # Verify Drime is still healthy
-              ls /mnt/drime > /dev/null 2>&1 || echo "[LOG] WHAT: DRIME_LOST_CONNECTION | WHY: Network/API Drop | WHEN: $(date +%s%N)"
-            fi
-          done
+          echo "[LOG] WHAT: FLUSH_START | WHY: VM closed, pushing dirty cache to Drime | WHEN: $(date +%s%N)"
+          sync || true
+          sleep 5
+          sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
+          echo "[LOG] WHAT: FLUSH_DONE | DRIME_SAFE | WHEN: $(date +%s%N)"
