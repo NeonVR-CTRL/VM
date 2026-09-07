@@ -1,4 +1,4 @@
-name: AetherGrid AIO (Aether-Core Edition)
+name: AetherGrid AIO (Aether-Core v6)
 
 on:
   workflow_dispatch:
@@ -13,14 +13,20 @@ jobs:
       DRIME: ${{ secrets.DRIME }}
 
     steps:
-      - name: Install Core Stack (QEMU, NetBird, Rclone)
+      - name: Install Core Stack (QEMU, Rclone)
         run: |
-          echo "[LOG] WHAT: STACK_INSTALL | WHICH: QEMU-Utils, NetBird, Rclone | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: STACK_INSTALL | WHICH: QEMU, Rclone | WHEN: $(date +%s%N)"
           sudo apt-get update -y
-          sudo apt-get install -y qemu-system-x86 qemu-utils qemu-system-common netbird
+          sudo apt-get install -y qemu-system-x86 qemu-utils qemu-system-common fuse3
           
           # Install Latest Rclone
           curl https://rclone.org/install.sh | sudo bash
+
+      - name: Install NetBird (The Fix)
+        run: |
+          echo "[LOG] WHAT: NETBIRD_INSTALL | WHICH: Official Script | WHEN: $(date +%s%N)"
+          # This script adds the repo AND installs NetBird automatically
+          curl -fsSL https://pkgs.netbird.io/install.sh | sh
 
       - name: Initialize NetBird Mesh
         run: |
@@ -36,9 +42,8 @@ jobs:
           sudo mount -t tmpfs -o size=14G tmpfs /ramdisk
           sudo mkdir -p /ramdisk/cache
 
-      - name: Generate Drime WebDAV Config (The "Universal" Fix)
+      - name: Generate Drime WebDAV Config
         run: |
-          # Drime uses WebDAV with Bearer Tokens. We generate the config dynamically.
           cat <<EOF > /tmp/rclone.conf
           [drime]
           type = webdav
@@ -53,7 +58,6 @@ jobs:
           sudo mkdir -p /mnt/drime
           sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf
           
-          # Mount with optimized VFS for User-Space NVMe
           sudo rclone mount drime: /mnt/drime \
             --config /tmp/rclone.conf \
             --vfs-cache-mode full \
@@ -70,7 +74,7 @@ jobs:
             exit 1
           fi
 
-      - name: Download Ubuntu ISO
+      - name: Download Ubuntu ISO to RAM (10,000% Faster than Network Read)
         run: |
           wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/noble/ubuntu-24.04.1-live-server-amd64.iso"
           echo "[LOG] WHAT: ISO_READY | WHICH: /ramdisk/ubuntu.iso | WHEN: $(date +%s%N)"
@@ -80,9 +84,8 @@ jobs:
           sudo qemu-img create -f raw /mnt/drime/core.img 10G
           echo "[LOG] WHAT: BLOCK_DEV_CREATED | WHICH: /mnt/drime/core.img | WHEN: $(date +%s%N)"
 
-      - name: Launch User-Space NVMe Daemon (The "ARM" Innovation)
+      - name: Launch User-Space NVMe Daemon (Aether-Core)
         run: |
-          # This launches the storage daemon in User Space, bypassing kernel overhead
           sudo qemu-storage-daemon \
             --blockdev driver=file,node-name=disk0,filename=/mnt/drime/core.img,aio=threads \
             --export type=vhost-user-blk,id=export0,node-name=disk0,addr.type=unix,addr.path=/tmp/vhost.sock &
@@ -92,7 +95,6 @@ jobs:
 
       - name: Boot QEMU VM (Aether-Core Mode)
         run: |
-          # Connects directly to the User-Space NVMe socket
           sudo qemu-system-x86_64 \
             -m 8192 \
             -smp 4 \
