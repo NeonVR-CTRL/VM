@@ -1,110 +1,48 @@
-name: AetherGrid Direct-Drime OS Boot (FIXED v3)
-
-on:
-  workflow_dispatch:
-
-jobs:
-  boot-iso:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360 # 6 Hours Hard Limit
-
-    env:
-      NB_SK: ${{ secrets.NB_SK }}
-      DRIME: ${{ secrets.DRIME }}
-
-    steps:
-      - name: Install Core Dependencies (LATEST Rclone, QEMU, NetBird)
-        run: |
-          echo "[LOG] WHAT: DEPENDENCY_INSTALL_STARTED | WHICH: Latest Rclone, QEMU, NetBird | WHEN: $(date +%s%N)"
-          sudo apt-get update -y
-          sudo apt-get install -y qemu-system-x86 qemu-utils util-linux
-          
-          # FORCE INSTALL LATEST RCLONE
-          curl https://rclone.org/install.sh | sudo bash
-          
-          curl -fsSL https://pkgs.netbird.io/install.sh | sh
-          echo "[LOG] WHAT: NETBIRD_BINARY_INSTALLED | WHICH: NetBird Client | WHEN: $(date +%s%N)"
-
-      - name: Initialize NetBird Mesh (Via NB_SK)
-        run: |
-          echo "[LOG] WHAT: SECRET_INJECTION_SUCCESS | WHICH: NB_SK | VALUE: [REDACTED] | WHEN: $(date +%s%N)"
-          sudo netbird up --setup-key "$NB_SK" --log-level debug &
-          sleep 10
-          echo "[LOG] WHAT: P2P_TUNNEL_ESTABLISHED | WHICH: wt0 | WHEN: $(date +%s%N)"
-
-      - name: Create RAM Disk (Strict Zero Local Storage)
-        run: |
-          echo "[LOG] WHAT: RAM_DISK_CREATED | WHICH: /ramdisk (14GB tmpfs) | WHEN: $(date +%s%N)"
-          sudo mkdir -p /ramdisk
-          sudo mount -t tmpfs -o size=14G tmpfs /ramdisk
-          sudo mkdir -p /ramdisk/rclone_cache
-
-      - name: Download Ubuntu 26.04 LTS ISO to RAM
-        run: |
-          echo "[LOG] WHAT: ISO_DOWNLOAD_STARTED | WHICH: Ubuntu 26.04 LTS | WHEN: $(date +%s%N)"
-          wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/26.04/ubuntu-26.04-live-server-amd64.iso" || wget -O /ramdisk/ubuntu.iso "https://releases.ubuntu.com/noble/ubuntu-24.04.1-live-server-amd64.iso"
-          echo "[LOG] WHAT: ISO_DOWNLOAD_COMPLETE | WHICH: /ramdisk/ubuntu.iso | WHEN: $(date +%s%N)"
-
-      - name: Mount Drime Direct (Zero Local Storage)
-        run: |
-          echo "[LOG] WHAT: DRIME_SECRET_LOADED | WHICH: DRIME | VALUE: [REDACTED] | WHEN: $(date +%s%N)"
-          sudo mkdir -p /mnt/drime
-          
-          # FIX: Enable FUSE permissions for --allow-other
-          sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf
-          
-          # FIX: Run in background with sudo (No --daemon flag)
-          sudo rclone mount :drime,token=${DRIME}: /mnt/drime --vfs-cache-mode writes --cache-dir /ramdisk/rclone_cache --allow-other --log-level INFO &
-          
-          # Wait for the mount to establish
-          sleep 15
-          
-          # Verify the mount is active
-          if mountpoint -q /mnt/drime; then
-            echo "[LOG] WHAT: DRIME_MOUNTED_SUCCESS | WHICH: /mnt/drime | WHEN: $(date +%s%N)"
-          else
-            echo "[LOG] WHAT: DRIME_MOUNT_FAILED | WHY: FUSE_ERROR | WHEN: $(date +%s%N)"
-            exit 1
-          fi
-
-      - name: Create Direct Block Device on Drime
-        run: |
-          echo "[LOG] WHAT: SPARSE_IMAGE_CREATION | WHICH: /mnt/drime/ubuntu_root.img (100GB) | WHEN: $(date +%s%N)"
-          # Create a 100GB sparse file directly on the Drime mount
-          sudo qemu-img create -f raw /mnt/drime/ubuntu_root.img 100G
-          
-          # Map it to a loop device so QEMU sees it as a real physical hard drive (/dev/sda)
-          sudo losetup -fP /mnt/drime/ubuntu_root.img
-          LOOP_DEV=$(losetup -a | grep ubuntu_root.img | cut -d: -f1)
-          echo "LOOP_DEVICE=$LOOP_DEV" >> $GITHUB_ENV
-          echo "[LOG] WHAT: LOOP_DEVICE_MAPPED | WHICH: $LOOP_DEV -> Drime | WHEN: $(date +%s%N)"
-
-      - name: Launch QEMU VM & Expose VNC (0.0.0.0:5900)
-        run: |
-          echo "[LOG] WHAT: QEMU_BOOT_INITIATED | WHICH: Ubuntu ISO + Drime Block Device | WHEN: $(date +%s%N)"
-          
-          # Launch QEMU
-          sudo qemu-system-x86_64 \
-            -m 12288 \
-            -smp 4 \
-            -accel kvm -accel tcg \
-            -cpu host \
-            -boot d \
-            -cdrom /ramdisk/ubuntu.iso \
-            -hda ${{ env.LOOP_DEV }} \
-            -vnc 0.0.0.0:0 \
-            -display none \
-            -daemonize
-            
-          echo "[LOG] WHAT: VNC_BIND_ALL_INTERFACES | WHICH: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
-          echo "[LOG] WHAT: VM_LAUNCHED | WHICH: Connect via NetBird IP:5900 | WHEN: $(date +%s%N)"
-
-      - name: 6-Hour Keep-Alive & Telemetry
-        run: |
-          echo "[LOG] WHAT: KEEP_ALIVE_LOOP_STARTED | WHICH: 6 Hours | WHEN: $(date +%s%N)"
-          for i in $(seq 1 21600); do
-            sleep 1
-            if [ $((i % 300)) -eq 0 ]; then
-              echo "[LOG] WHAT: CI_STEALTH_HEARTBEAT | WHICH: Uptime: $((i/60))m | WHEN: $(date +%s%N)"
-            fi
-          done
+Skip to content
+NeonVR-CTRL
+VM
+Repository navigation
+Code
+Issues
+Pull requests
+Agents
+Actions
+Projects
+Wiki
+Security and quality
+Insights
+Settings
+AetherGrid Direct-Drime OS Boot (FIXED v3)
+AetherGrid Direct-Drime OS Boot (FIXED v3) #5
+All jobs
+Run details
+boot-iso
+failed now in 1m 27s
+Search logs
+0s
+39s
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+Error: install service: Init already exists: /etc/systemd/system/netbird.service
+NetBird service has already been loaded
+NetBird service has been started
+Installation has been finished. To connect, you need to run NetBird by executing the following command:
+netbird up
+[LOG] WHAT: NETBIRD_BINARY_INSTALLED | WHICH: NetBird Client | WHEN: 1788809956393168076
+10s
+Run echo "[LOG] WHAT: SECRET_INJECTION_SUCCESS | WHICH: NB_SK | VALUE: [REDACTED] | WHEN: $(date +%s%N)"
+[LOG] WHAT: SECRET_INJECTION_SUCCESS | WHICH: NB_SK | VALUE: [REDACTED] | WHEN: 1788809956416300651
+2026-09-07T19:39:16.434Z DEBG client/cmd/up.go:387: failed to get profile state for login hint: profile state file does not exist
+Connected
+[LOG] WHAT: P2P_TUNNEL_ESTABLISHED | WHICH: wt0 | WHEN: 1788809966419993596
+0s
+14s
+20s
+1s
+Run echo "[LOG] WHAT: SPARSE_IMAGE_CREATION | WHICH: /mnt/drime/ubuntu_root.img (100GB) | WHEN: $(date +%s%N)"
+[LOG] WHAT: SPARSE_IMAGE_CREATION | WHICH: /mnt/drime/ubuntu_root.img (100GB) | WHEN: 1788810000089911660
+Formatting '/mnt/drime/ubuntu_root.img', fmt=raw size=107374182400
+qemu-img: /mnt/drime/ubuntu_root.img: Could not create '/mnt/drime/ubuntu_root.img': Input/output error
+Error: Process completed with exit code 1.
+0s
+0s
+0s
