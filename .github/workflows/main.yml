@@ -1,4 +1,4 @@
-name: AetherGrid AIO (AetherShard v19)
+name: AetherGrid AIO (Nbdkit Shard v20)
 
 on:
   workflow_dispatch:
@@ -21,16 +21,18 @@ jobs:
       DRIME3: ${{ secrets.DRIME3 }}
 
     steps:
-      - name: Install Minimal Stack
+      - name: Install Minimal Stack (+ nbdkit)
         run: |
           set -e
           sudo apt-get update -y
           sudo apt-get remove -y rclone || true
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 qemu-utils qemu-system-common fuse3 wget curl ca-certificates python3
+            qemu-system-x86 qemu-utils qemu-system-common fuse3 wget curl ca-certificates python3 \
+            nbdkit python3-dev
+          sudo apt-get install -y --no-install-recommends nbdkit-python-plugin || true
           curl https://rclone.org/install.sh | sudo bash
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
-          echo "[LOG] WHAT: INSTALL_DONE | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: INSTALL_DONE | NBDKIT: $(nbdkit --version | head -1) | WHEN: $(date +%s%N)"
 
       - name: NetBird Mesh Up
         run: |
@@ -122,15 +124,17 @@ jobs:
           mountpoint -q /mnt/drime
           echo "[LOG] WHAT: DRIME_MOUNT_OK | WHEN: $(date +%s%N)"
 
-      - name: Write AetherShard Daemon (GO-aware NBD)
+      - name: Write Shard Plugin (nbdkit python)
         run: |
-          cat > /tmp/aethershard.py <<'PYEOF'
-          import os,socket,struct,threading,subprocess,time,signal,traceback
+          cat > /tmp/shard_plugin.py <<'PYEOF'
+          import os, subprocess, threading, time
           from concurrent.futures import ThreadPoolExecutor
-          CONF="/tmp/rclone.conf"; REMOTE=os.environ["REMOTE"]; VSIZE=int(os.environ["VSIZE"])*1024**3
-          SHARD=4*1024*1024; PORT=10809; DIRTY_MAX=256*1024*1024
-          RC=["rclone","--config",CONF]
-          REP_MAGIC=0x3e889044565bf931; REP_ACK=1; REP_INFO=3; REP_ERR_UNSUP=0x80000001
+          import nbdkit
+          API_VERSION = 1
+          THREAD_MODEL = nbdkit.THREAD_MODEL_PARALLEL
+          REMOTE=os.environ["REMOTE"]; VSIZE=int(os.environ["VSIZE"])*1024**3
+          SHARD=4*1024*1024; DIRTY_MAX=256*1024*1024
+          RC=["rclone","--config","/tmp/rclone.conf"]
           lock=threading.Lock(); cond=threading.Condition(lock)
           dirty={}; touched={}; uploading={}; fetching=set()
           def name(i): return f"vm/shard_{i:06d}"
@@ -154,6 +158,7 @@ jobs:
                           else: dirty[i]=uploading.pop(i); touched[i]=time.time()
                       cond.notify_all()
                   time.sleep(0.5)
+          threading.Thread(target=uploader,daemon=True).start()
           def drain():
               while True:
                   with lock:
@@ -170,6 +175,12 @@ jobs:
                   fetching.discard(i)
                   if i not in dirty: dirty[i]=b; touched[i]=time.time()
                   return dirty[i]
+          def read_at(off,length):
+              out=bytearray(); pos=0
+              while pos<length:
+                  i=off//SHARD; s=off-i*SHARD; n=min(SHARD-s,length-pos)
+                  out+=shard_buf(i)[s:s+n]; off+=n; pos+=n
+              return bytes(out)
           def write_at(off,data):
               pos=0
               while pos<len(data):
@@ -179,93 +190,43 @@ jobs:
                       b[s:s+n]=data[pos:pos+n]; touched[i]=time.time()
                       while len(dirty)*SHARD>DIRTY_MAX: cond.wait(0.2)
                   off+=n; pos+=n
-          def read_at(off,length):
-              out=bytearray(); pos=0
-              while pos<length:
-                  i=off//SHARD; s=off-i*SHARD; n=min(SHARD-s,length-pos)
-                  out+=shard_buf(i)[s:s+n]; off+=n; pos+=n
-              return bytes(out)
-          def rd(f,n):
-              b=f.read(n); return b if len(b)==n else None
-          def handle(conn):
-              try:
-                  f=conn.makefile("rwb")
-                  f.write(b"NBDMAGIC"+struct.pack(">Q",0x49484156454f5054)+struct.pack(">H",1)); f.flush()
-                  if rd(f,4) is None: return
-                  while True:
-                      if rd(f,8) is None: return
-                      tln=rd(f,8)
-                      if tln is None: return
-                      opt,ln=struct.unpack(">II",tln)
-                      if ln and rd(f,ln) is None: return
-                      if opt==1:
-                          f.write(struct.pack(">Q",VSIZE)+struct.pack(">I",0x0005)+b"\x00"*124); f.flush(); break
-                      elif opt in (6,7):
-                          f.write(struct.pack(">Q",REP_MAGIC)+struct.pack(">II",REP_INFO,12)+struct.pack(">HQH",0,VSIZE,0x0005)); f.flush()
-                          f.write(struct.pack(">Q",REP_MAGIC)+struct.pack(">II",REP_ACK,0)); f.flush()
-                          if opt==7: break
-                      else:
-                          f.write(struct.pack(">Q",REP_MAGIC)+struct.pack(">II",REP_ERR_UNSUP,0)); f.flush()
-                  while True:
-                      hdr=rd(f,28)
-                      if hdr is None: return
-                      magic,typ,handle,off,ln=struct.unpack(">IIQQI",hdr)
-                      if typ==0:
-                          f.write(struct.pack(">IIQ",0x67446698,0,handle)+read_at(off,ln)); f.flush()
-                      elif typ==1:
-                          d=rd(f,ln)
-                          if d is None: return
-                          write_at(off,d)
-                          f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
-                      elif typ==3:
-                          drain(); f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
-                      elif typ==2:
-                          drain(); f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush(); return
-                      else:
-                          f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
-              except Exception:
-                  traceback.print_exc()
-                  return
-              finally:
-                  try: conn.close()
-                  except Exception: pass
-          def on_term(sig,frm):
-              threading.Thread(target=lambda:(drain(),os._exit(0))).start()
-          signal.signal(signal.SIGTERM,on_term); signal.signal(signal.SIGINT,on_term)
-          threading.Thread(target=uploader,daemon=True).start()
-          srv=socket.socket(); srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-          srv.bind(("127.0.0.1",PORT)); srv.listen(4)
-          print(f"[LOG] WHAT: AETHERSHARD_READY | PORT: {PORT} | VSIZE: {VSIZE} | WHEN: {time.time_ns()}",flush=True)
-          while True:
-              conn,_=srv.accept(); threading.Thread(target=handle,args=(conn,),daemon=True).start()
+          def open(readonly):
+              if readonly: raise RuntimeError("rw required")
+              return {}
+          def get_size(h): return VSIZE
+          def pread(h,count,offset): return read_at(offset,count)
+          def pwrite(h,buf,offset): write_at(offset,bytes(buf))
+          def flush(h): drain()
+          def can_flush(h): return True
+          def unload(): drain()
           PYEOF
-          python3 -m py_compile /tmp/aethershard.py
-          echo "[LOG] WHAT: DAEMON_COMPILED | WHEN: $(date +%s%N)"
+          python3 -m py_compile /tmp/shard_plugin.py
+          echo "[LOG] WHAT: PLUGIN_COMPILED | WHEN: $(date +%s%N)"
 
-      - name: Launch Daemon + Assert Alive
+      - name: Launch nbdkit + Assert Socket
         run: |
           set -e
-          REMOTE=$REMOTE VSIZE=$VSIZE nohup python3 /tmp/aethershard.py > /tmp/aethershard.log 2>&1 &
+          REMOTE=$REMOTE VSIZE=$VSIZE nohup nbdkit -f -U /tmp/nbd.sock python /tmp/shard_plugin.py > /tmp/nbdkit.log 2>&1 &
           sleep 6
-          cat /tmp/aethershard.log
-          grep -q AETHERSHARD_READY /tmp/aethershard.log
-          (exec 3<>/dev/tcp/127.0.0.1/10809) 2>/dev/null || { echo "[LOG] WHAT: NBD_PORT_DEAD | WHEN: $(date +%s%N)"; exit 1; }
-          echo "[LOG] WHAT: DAEMON_ALIVE | WHEN: $(date +%s%N)"
+          cat /tmp/nbdkit.log || true
+          [ -S /tmp/nbd.sock ] || { echo "[LOG] WHAT: NBD_SOCK_MISSING | WHEN: $(date +%s%N)"; exit 1; }
+          echo "[LOG] WHAT: NBDKIT_ALIVE | SOCK: /tmp/nbd.sock | WHEN: $(date +%s%N)"
 
-      - name: Probe NBD (Timeout-Guarded, Non-Gating)
+      - name: Probe NBD (Timeout-Guarded)
         run: |
-          if timeout 15 qemu-img info nbd:127.0.0.1:10809; then
-            echo "[LOG] WHAT: NBD_PROTOCOL_VERIFIED | WHEN: $(date +%s%N)"
+          if timeout 20 qemu-img info nbd:unix:/tmp/nbd.sock; then
+            echo "[LOG] WHAT: NBD_PROTOCOL_VERIFIED | VIA: nbdkit | WHEN: $(date +%s%N)"
           else
-            echo "[LOG] WHAT: NBD_PROBE_WARN | WHY: timeout_or_error | ACTION: continuing to boot | WHEN: $(date +%s%N)"
-            tail -20 /tmp/aethershard.log || true
+            echo "[LOG] WHAT: NBD_PROBE_FAIL | WHY: see nbdkit log | WHEN: $(date +%s%N)"
+            tail -30 /tmp/nbdkit.log || true
+            exit 1
           fi
 
-      - name: Boot VM (Disk = Drime Shards RAW, VNC 5900)
+      - name: Boot VM (Disk = Drime Shards via nbdkit, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 12288 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
-          ARGS="$ARGS -drive file=nbd:127.0.0.1:10809,if=virtio,format=raw,cache=none"
+          ARGS="$ARGS -drive file=nbd:unix:/tmp/nbd.sock,if=virtio,format=raw,cache=none"
           if [ "$MODE" = "FIRST" ]; then
             if [ "$ISO_SRC" = "drime" ]; then ARGS="$ARGS -boot order=dc -cdrom /mnt/drime/iso/ubuntu.iso"
             else ARGS="$ARGS -boot order=dc -cdrom https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; fi
@@ -293,9 +254,9 @@ jobs:
           echo "[LOG] WHAT: DRAIN_START | WHEN: $(date +%s%N)"
           sudo pkill -TERM -f qemu-system-x86_64 || true
           sleep 3
-          pkill -TERM -f aethershard.py || true
+          sudo pkill -TERM -f nbdkit || true
           sleep 15
-          tail -20 /tmp/aethershard.log || true
+          tail -20 /tmp/nbdkit.log || true
           echo "[LOG] WHAT: FINAL_SHARDS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
           if [ "$MODE" = "FIRST" ] && [ "$VMEXIT" = "0" ] && [ "$ACCOUNTS" -eq 1 ]; then
             rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
