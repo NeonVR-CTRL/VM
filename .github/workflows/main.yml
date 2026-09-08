@@ -1,4 +1,4 @@
-name: AetherGrid AIO (ShardFS v25)
+name: AetherGrid AIO (ShardFS v26)
 
 on:
   workflow_dispatch:
@@ -21,13 +21,13 @@ jobs:
       DRIME3: ${{ secrets.DRIME3 }}
 
     steps:
-      - name: Install Minimal Stack (+ libfuse2 + fusepy FOR ROOT)
+      - name: Install Minimal Stack (+ qemu-block-extra + fusepy FOR ROOT)
         run: |
           set -e
           sudo apt-get update -y
           sudo apt-get remove -y rclone || true
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 qemu-utils qemu-system-common fuse3 libfuse2 wget curl ca-certificates python3 python3-pip
+            qemu-system-x86 qemu-utils qemu-system-common qemu-block-extra fuse3 libfuse2 wget curl ca-certificates python3 python3-pip
           curl https://rclone.org/install.sh | sudo bash
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
           sudo pip3 install --break-system-packages fusepy
@@ -87,17 +87,18 @@ jobs:
           echo "VSIZE=$VSIZE" >> $GITHUB_ENV
           echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Write ShardFS Daemon (overwrite-safe puts)
+      - name: Write ShardFS Daemon (read-cache vs dirty separated)
         run: |
           cat > /tmp/shardfs.py <<'PYEOF'
           import os,stat,errno,subprocess,threading,time,signal,traceback
+          from collections import OrderedDict
           from concurrent.futures import ThreadPoolExecutor
           from fuse import FUSE, FuseOSError, Operations
           CONF="/tmp/rclone.conf"; REMOTE=os.environ["REMOTE"]; VSIZE=int(os.environ["VSIZE"])*1024**3
-          SHARD=4*1024*1024; DIRTY_MAX=256*1024*1024; MNT="/mnt/sharddisk"
+          SHARD=4*1024*1024; DIRTY_MAX=256*1024*1024; MNT="/mnt/sharddisk"; CACHE_MAX=64
           RC=["rclone","--config",CONF]
           lock=threading.Lock(); cond=threading.Condition(lock)
-          dirty={}; touched={}; uploading={}; fetching=set()
+          dirty={}; touched={}; uploading={}; fetching=set(); cache=OrderedDict()
           def name(i): return f"vm/shard_{i:06d}"
           def put(i,data):
               p=subprocess.run(RC+["rcat",f"{REMOTE}:{name(i)}"],input=bytes(data),capture_output=True)
@@ -131,19 +132,17 @@ jobs:
               with lock:
                   if i in dirty: return dirty[i]
                   if i in uploading: return uploading[i]
+                  if i in cache:
+                      cache.move_to_end(i); return cache[i]
                   while i in fetching: cond.wait(0.2)
                   fetching.add(i)
               b=get(i)
               with lock:
                   fetching.discard(i)
-                  if i not in dirty: dirty[i]=b; touched[i]=time.time()
-                  return dirty[i]
-          def read_at(off,length):
-              out=bytearray(); pos=0
-              while pos<length:
-                  i=off//SHARD; s=off-i*SHARD; n=min(SHARD-s,length-pos)
-                  out+=shard_buf(i)[s:s+n]; off+=n; pos+=n
-              return bytes(out)
+                  if i in dirty: return dirty[i]
+                  cache[i]=b; cache.move_to_end(i)
+                  while len(cache)>CACHE_MAX: cache.popitem(last=False)
+                  return b
           def write_at(off,data):
               pos=0
               while pos<len(data):
@@ -151,8 +150,15 @@ jobs:
                   b=shard_buf(i)
                   with lock:
                       b[s:s+n]=data[pos:pos+n]; touched[i]=time.time()
+                      cache.pop(i,None); dirty[i]=b
                       while len(dirty)*SHARD>DIRTY_MAX: cond.wait(0.2)
                   off+=n; pos+=n
+          def read_at(off,length):
+              out=bytearray(); pos=0
+              while pos<length:
+                  i=off//SHARD; s=off-i*SHARD; n=min(SHARD-s,length-pos)
+                  out+=shard_buf(i)[s:s+n]; off+=n; pos+=n
+              return bytes(out)
           class ShardFS(Operations):
               def getattr(self,path,fh=None):
                   if path=="/": return dict(st_mode=(stat.S_IFDIR|0o755),st_nlink=2)
