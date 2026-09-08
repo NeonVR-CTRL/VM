@@ -1,4 +1,4 @@
-name: AetherGrid AIO (ShardFS v26)
+name: AetherGrid AIO (ShardFS ZeroRAM v28)
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
       DRIME3: ${{ secrets.DRIME3 }}
 
     steps:
-      - name: Install Minimal Stack (+ qemu-block-extra + fusepy FOR ROOT)
+      - name: Install Minimal Stack
         run: |
           set -e
           sudo apt-get update -y
@@ -67,7 +67,7 @@ jobs:
           echo "ACCOUNTS=$N"    >> $GITHUB_ENV
           echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | WHEN: $(date +%s%N)"
 
-      - name: Create Real Parent Folder + Self-Heal + Size
+      - name: Parent Folder + Self-Heal + Mode + Size
         run: |
           set -e
           rclone mkdir --config /tmp/rclone.conf "${REMOTE}:vm" || true
@@ -77,17 +77,43 @@ jobs:
             echo "[LOG] WHAT: SELF_HEAL | purged+recreated vm/ | WHEN: $(date +%s%N)"
           fi
           EXIST=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | head -1 || true)
-          if [ -n "$EXIST" ]; then
-            MODE=BOOT
-          else
-            MODE=FIRST
-          fi
+          if [ -n "$EXIST" ]; then MODE=BOOT; else MODE=FIRST; fi
           if [ "$ACCOUNTS" -eq 1 ]; then VSIZE=18; else VSIZE=$((18*ACCOUNTS-4)); fi
           echo "MODE=$MODE"   >> $GITHUB_ENV
           echo "VSIZE=$VSIZE" >> $GITHUB_ENV
           echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Write ShardFS Daemon (read-cache vs dirty separated)
+      - name: Resolve Media (Drime ISO cache-off = ZERO RAM, HTTPS last resort)
+        if: env.MODE == 'FIRST'
+        run: |
+          set -e
+          HAS=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:iso" 2>/dev/null | grep -c '^ubuntu.iso$' || true)
+          if [ "${HAS:-0}" != "0" ]; then
+            sudo mkdir -p /mnt/drime
+            sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
+            sudo rclone mount "${REMOTE}:" /mnt/drime \
+              --config /tmp/rclone.conf \
+              --vfs-cache-mode off \
+              --allow-other --log-level INFO --daemon
+            sleep 8
+            mountpoint -q /mnt/drime
+            [ -f /mnt/drime/iso/ubuntu.iso ]
+            echo "CDROM=/mnt/drime/iso/ubuntu.iso" >> $GITHUB_ENV
+            echo "MEDIASRC=drime" >> $GITHUB_ENV
+            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: Drime iso/ | CACHE: OFF | RAM: 0 | WHEN: $(date +%s%N)"
+          else
+            ISO_URL=""
+            for u in "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso" \
+                     "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; do
+              if curl -sfI "$u" | head -1 | grep -qE "HTTP/[^ ]+ (200|302)"; then ISO_URL=$u; break; fi
+            done
+            [ -n "$ISO_URL" ] || { echo "[LOG] WHAT: MEDIA_DEAD | WHEN: $(date +%s%N)"; exit 1; }
+            echo "CDROM=$ISO_URL" >> $GITHUB_ENV
+            echo "MEDIASRC=https" >> $GITHUB_ENV
+            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: $ISO_URL | RAM: 0 | WHEN: $(date +%s%N)"
+          fi
+
+      - name: Write ShardFS Daemon
         run: |
           cat > /tmp/shardfs.py <<'PYEOF'
           import os,stat,errno,subprocess,threading,time,signal,traceback
@@ -204,23 +230,19 @@ jobs:
           ls -l /mnt/sharddisk/disk.img
           echo "[LOG] WHAT: SHARDFS_ALIVE | WHEN: $(date +%s%N)"
 
-      - name: Probe Disk (Plain File, No Wire)
+      - name: Probe Disk
         run: |
           set -e
           qemu-img info /mnt/sharddisk/disk.img
           echo "[LOG] WHAT: DISK_PROBE_VERIFIED | WHEN: $(date +%s%N)"
 
-      - name: Boot VM (Disk=Drime Shards, CD=HTTPS Mirror, VNC 5900)
+      - name: Boot VM (Disk=Drime Shards, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 12288 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
           ARGS="$ARGS -drive file=/mnt/sharddisk/disk.img,if=virtio,format=raw,cache=none"
-          if [ "$MODE" = "FIRST" ]; then
-            ARGS="$ARGS -boot order=dc -cdrom https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"
-          else
-            ARGS="$ARGS -boot order=c"
-          fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | CD: https mirror | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          if [ "$MODE" = "FIRST" ]; then ARGS="$ARGS -boot order=dc -cdrom $CDROM"; else ARGS="$ARGS -boot order=c"; fi
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | MEDIA: $MEDIASRC | RAM_USED_BY_STACK: ~0 | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
           ( while true; do sleep 300; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
             free -h | head -2 || true; \
@@ -235,7 +257,7 @@ jobs:
           echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
           exit $EXIT
 
-      - name: Drain + Cleanup (ALWAYS)
+      - name: Drain + ISO Cleanup + Unmount (ALWAYS)
         if: always()
         run: |
           echo "[LOG] WHAT: DRAIN_START | WHEN: $(date +%s%N)"
@@ -245,4 +267,10 @@ jobs:
           sleep 15
           tail -20 /tmp/shardfs.log || true
           echo "[LOG] WHAT: FINAL_SHARDS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
+          if [ "$MODE" = "FIRST" ] && [ "$VMEXIT" = "0" ] && [ "$MEDIASRC" = "drime" ]; then
+            rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
+            echo "[LOG] WHAT: ISO_CLEANUP | 3.2G quota freed | WHEN: $(date +%s%N)"
+          fi
+          sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
+          sudo umount /mnt/sharddisk || sudo fusermount3 -u /mnt/sharddisk || true
           echo "[LOG] WHAT: DRAIN_DONE | WHEN: $(date +%s%N)"
