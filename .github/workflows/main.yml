@@ -1,4 +1,4 @@
-name: AetherGrid AIO (ShardFS v24)
+name: AetherGrid AIO (ShardFS v25)
 
 on:
   workflow_dispatch:
@@ -31,7 +31,6 @@ jobs:
           curl https://rclone.org/install.sh | sudo bash
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
           sudo pip3 install --break-system-packages fusepy
-          python3 -c "import fuse; print('fusepy OK (user)')"
           sudo python3 -c "import fuse; print('fusepy OK (root)')"
           echo "[LOG] WHAT: INSTALL_DONE | WHEN: $(date +%s%N)"
 
@@ -68,16 +67,10 @@ jobs:
           echo "ACCOUNTS=$N"    >> $GITHUB_ENV
           echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | WHEN: $(date +%s%N)"
 
-      - name: Create Real Parent Folders
+      - name: Create Real Parent Folder + Self-Heal + Size
         run: |
           set -e
-          rclone mkdir --config /tmp/rclone.conf "${REMOTE}:vm"  || true
-          rclone mkdir --config /tmp/rclone.conf "${REMOTE}:iso" || true
-          echo "[LOG] WHAT: PARENT_FOLDERS_READY | WHEN: $(date +%s%N)"
-
-      - name: Self-Heal + Mode + Virtual Size
-        run: |
-          set -e
+          rclone mkdir --config /tmp/rclone.conf "${REMOTE}:vm" || true
           if [ "${{ github.event.inputs.force_reinstall }}" = "true" ]; then
             rclone purge --config /tmp/rclone.conf "${REMOTE}:vm" || true
             rclone mkdir --config /tmp/rclone.conf "${REMOTE}:vm" || true
@@ -86,46 +79,15 @@ jobs:
           EXIST=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | head -1 || true)
           if [ -n "$EXIST" ]; then
             MODE=BOOT
-            if [ "$ACCOUNTS" -eq 1 ]; then VSIZE=18; else VSIZE=$((18*ACCOUNTS-4)); fi
           else
             MODE=FIRST
-            if [ "$ACCOUNTS" -eq 1 ]; then VSIZE=16; else VSIZE=$((18*ACCOUNTS-4)); fi
           fi
+          if [ "$ACCOUNTS" -eq 1 ]; then VSIZE=18; else VSIZE=$((18*ACCOUNTS-4)); fi
           echo "MODE=$MODE"   >> $GITHUB_ENV
           echo "VSIZE=$VSIZE" >> $GITHUB_ENV
           echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Stream ISO To Drime iso/ + HTTPS Fallback
-        if: env.MODE == 'FIRST'
-        run: |
-          HAS=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:iso" 2>/dev/null | grep -c '^ubuntu.iso$' || true)
-          if [ "${HAS:-0}" != "0" ]; then
-            echo "ISO_SRC=drime" >> $GITHUB_ENV
-            echo "[LOG] WHAT: ISO_REUSE | WHEN: $(date +%s%N)"
-          else
-            echo "[LOG] WHAT: ISO_STREAM_TO_DRIME | WHEN: $(date +%s%N)"
-            if wget -qO- "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" \
-               | rclone --config /tmp/rclone.conf rcat "${REMOTE}:iso/ubuntu.iso"; then
-              echo "ISO_SRC=drime" >> $GITHUB_ENV
-            else
-              echo "ISO_SRC=https" >> $GITHUB_ENV
-              echo "[LOG] WHAT: ISO_FALLBACK | SRC: https direct | WHEN: $(date +%s%N)"
-            fi
-          fi
-
-      - name: Mount Drime Read Path (cache-off)
-        run: |
-          set -e
-          sudo mkdir -p /mnt/drime
-          sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
-          sudo rclone mount "${REMOTE}:" /mnt/drime \
-            --config /tmp/rclone.conf --vfs-cache-mode off \
-            --allow-other --log-level INFO --daemon
-          sleep 8
-          mountpoint -q /mnt/drime
-          echo "[LOG] WHAT: DRIME_MOUNT_OK | WHEN: $(date +%s%N)"
-
-      - name: Write ShardFS Daemon (FUSE single-file block device)
+      - name: Write ShardFS Daemon (overwrite-safe puts)
         run: |
           cat > /tmp/shardfs.py <<'PYEOF'
           import os,stat,errno,subprocess,threading,time,signal,traceback
@@ -138,6 +100,9 @@ jobs:
           dirty={}; touched={}; uploading={}; fetching=set()
           def name(i): return f"vm/shard_{i:06d}"
           def put(i,data):
+              p=subprocess.run(RC+["rcat",f"{REMOTE}:{name(i)}"],input=bytes(data),capture_output=True)
+              if p.returncode==0: return True
+              subprocess.run(RC+["deletefile",f"{REMOTE}:{name(i)}"],capture_output=True)
               p=subprocess.run(RC+["rcat",f"{REMOTE}:{name(i)}"],input=bytes(data),capture_output=True)
               return p.returncode==0
           def get(i):
@@ -239,18 +204,17 @@ jobs:
           qemu-img info /mnt/sharddisk/disk.img
           echo "[LOG] WHAT: DISK_PROBE_VERIFIED | WHEN: $(date +%s%N)"
 
-      - name: Boot VM (Disk = ShardFS file, VNC 5900)
+      - name: Boot VM (Disk=Drime Shards, CD=HTTPS Mirror, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 12288 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
           ARGS="$ARGS -drive file=/mnt/sharddisk/disk.img,if=virtio,format=raw,cache=none"
           if [ "$MODE" = "FIRST" ]; then
-            if [ "$ISO_SRC" = "drime" ]; then ARGS="$ARGS -boot order=dc -cdrom /mnt/drime/iso/ubuntu.iso"
-            else ARGS="$ARGS -boot order=dc -cdrom https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; fi
+            ARGS="$ARGS -boot order=dc -cdrom https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"
           else
             ARGS="$ARGS -boot order=c"
           fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | ISO_SRC: $ISO_SRC | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | CD: https mirror | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
           ( while true; do sleep 300; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
             free -h | head -2 || true; \
@@ -265,7 +229,7 @@ jobs:
           echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
           exit $EXIT
 
-      - name: Drain + Guarded Cleanup (ALWAYS)
+      - name: Drain + Cleanup (ALWAYS)
         if: always()
         run: |
           echo "[LOG] WHAT: DRAIN_START | WHEN: $(date +%s%N)"
@@ -275,10 +239,4 @@ jobs:
           sleep 15
           tail -20 /tmp/shardfs.log || true
           echo "[LOG] WHAT: FINAL_SHARDS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
-          if [ "$MODE" = "FIRST" ] && [ "$VMEXIT" = "0" ] && [ "$ACCOUNTS" -eq 1 ]; then
-            rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
-            echo "[LOG] WHAT: ISO_CLEANUP | quota freed for 18G | WHEN: $(date +%s%N)"
-          fi
-          sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
-          sudo umount /mnt/sharddisk || sudo fusermount3 -u /mnt/sharddisk || true
           echo "[LOG] WHAT: DRAIN_DONE | WHEN: $(date +%s%N)"
