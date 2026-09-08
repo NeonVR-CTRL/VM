@@ -1,4 +1,4 @@
-name: AetherGrid AIO (AetherCore v33)
+name: AetherGrid AIO (AetherCore v34)
 
 on:
   workflow_dispatch:
@@ -83,7 +83,7 @@ jobs:
           echo "VSIZE=$VSIZE" >> $GITHUB_ENV
           echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Resolve Media (Mirror first, Drime proxy fallback) + Free Quota
+      - name: Resolve Media (Mirror first, Drime proxy fallback)
         if: env.MODE == 'FIRST'
         run: |
           set -e
@@ -95,16 +95,22 @@ jobs:
           if [ -n "$ISO_URL" ]; then
             echo "CDROM=$ISO_URL" >> $GITHUB_ENV
             echo "MEDIASRC=https" >> $GITHUB_ENV
-            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: mirror | DRIME: disk-only | WHEN: $(date +%s%N)"
+            echo "HAS_ISO=false"  >> $GITHUB_ENV
             rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
-            echo "[LOG] WHAT: ISO_OBJECT_DELETED | 2.7G quota freed | WHEN: $(date +%s%N)"
+            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: mirror | ISO_OBJECT_DELETED | WHEN: $(date +%s%N)"
           else
             echo "CDROM=/mnt/aether/iso.img" >> $GITHUB_ENV
-            echo "MEDIASRC=drime" >> $GITHUB_ENV
-            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: drime proxy 5Mi-aligned | WHEN: $(date +%s%N)"
+            echo "MEDIASRC=drime"            >> $GITHUB_ENV
+            echo "HAS_ISO=true"              >> $GITHUB_ENV
+            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: drime proxy | WHEN: $(date +%s%N)"
           fi
 
-      - name: Mount Drime (write-once transport, 512M bounded transit)
+      - name: BOOT mode inherits no-iso
+        if: env.MODE == 'BOOT'
+        run: |
+          echo "HAS_ISO=false" >> $GITHUB_ENV
+
+      - name: Mount Drime (write-once transport)
         run: |
           set -e
           sudo mkdir -p /mnt/drime /ramdisk
@@ -121,7 +127,7 @@ jobs:
           mountpoint -q /mnt/drime
           echo "[LOG] WHAT: TRANSPORT_MOUNT_OK | WHEN: $(date +%s%N)"
 
-      - name: Write AetherCore LOB Daemon (5Mi-aligned, short-read-safe proxy)
+      - name: Write AetherCore LOB Daemon (readdir/getattr consistent)
         run: |
           cat > /tmp/aethercore.py <<'PYEOF'
           import os,stat,errno,hashlib,zlib,json,threading,time,signal,traceback
@@ -130,6 +136,7 @@ jobs:
           from fuse import FUSE, FuseOSError, Operations
           ROOT="/mnt/drime/lob"; MNT="/mnt/aether"
           VSIZE=int(os.environ["VSIZE"])*1024**3
+          HAS_ISO=os.environ.get("HAS_ISO","false")=="true"
           SLOT=256*1024
           LRU_MAX=256*1024*1024//SLOT
           WIN=5*1024*1024
@@ -237,15 +244,18 @@ jobs:
               def getattr(self,path,fh=None):
                   if path=="/": return dict(st_mode=(stat.S_IFDIR|0o755),st_nlink=2)
                   if path=="/disk.img": return dict(st_mode=(stat.S_IFREG|0o600),st_nlink=1,st_size=VSIZE,st_blksize=4096,st_blocks=VSIZE//512)
-                  if path=="/iso.img":
-                      if ISO_SIZE[0]==0 and os.path.exists(ISO_PATH): ISO_SIZE[0]=os.path.getsize(ISO_PATH)
-                      if ISO_SIZE[0]: return dict(st_mode=(stat.S_IFREG|0o444),st_nlink=1,st_size=ISO_SIZE[0],st_blksize=4096)
+                  if path=="/iso.img" and HAS_ISO:
+                      if ISO_SIZE[0]==0:
+                          try: ISO_SIZE[0]=os.path.getsize(ISO_PATH)
+                          except FileNotFoundError: raise FuseOSError(errno.ENOENT)
+                      return dict(st_mode=(stat.S_IFREG|0o444),st_nlink=1,st_size=ISO_SIZE[0],st_blksize=4096)
                   raise FuseOSError(errno.ENOENT)
               def readdir(self,path,fh):
-                  for p in (".","..","disk.img","iso.img"): yield p
+                  yield "."; yield ".."; yield "disk.img"
+                  if HAS_ISO: yield "iso.img"
               def open(self,path,flags):
                   if path=="/disk.img": return 0
-                  if path=="/iso.img": return 1
+                  if path=="/iso.img" and HAS_ISO: return 1
                   raise FuseOSError(errno.ENOENT)
               def read(self,path,size,offset,fh):
                   if fh==1: return iso_read(offset,size)
@@ -277,7 +287,7 @@ jobs:
           os.makedirs(MNT,exist_ok=True)
           load_head()
           threading.Thread(target=bg_checkpoint,daemon=True).start()
-          print(f"[LOG] WHAT: AETHERCORE_READY | MNT: {MNT} | VSIZE: {VSIZE} | SLOT: 256K | WHEN: {time.time_ns()}",flush=True)
+          print(f"[LOG] WHAT: AETHERCORE_READY | MNT: {MNT} | VSIZE: {VSIZE} | HAS_ISO: {HAS_ISO} | WHEN: {time.time_ns()}",flush=True)
           FUSE(AetherFS(),MNT,foreground=True,direct_io=True,allow_other=True,nothreads=False)
           PYEOF
           python3 -m py_compile /tmp/aethercore.py
@@ -286,21 +296,21 @@ jobs:
       - name: Launch AetherCore + Assert
         run: |
           set -e
-          sudo env VSIZE=$VSIZE nohup python3 /tmp/aethercore.py > /tmp/aethercore.log 2>&1 &
+          sudo env VSIZE=$VSIZE HAS_ISO=$HAS_ISO nohup python3 /tmp/aethercore.py > /tmp/aethercore.log 2>&1 &
           sleep 8
           cat /tmp/aethercore.log
           grep -q AETHERCORE_READY /tmp/aethercore.log
           mountpoint -q /mnt/aether || { echo "[LOG] WHAT: AETHER_MOUNT_DEAD | WHEN: $(date +%s%N)"; exit 1; }
-          ls -l /mnt/aether/
+          ls -l /mnt/aether/disk.img
           echo "[LOG] WHAT: AETHERCORE_ALIVE | WHEN: $(date +%s%N)"
 
       - name: Probe Disk
         run: |
           set -e
           qemu-img info /mnt/aether/disk.img
-          echo "[LOG] WHAT: DISK_PROBE_VERIFIED | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DISK_PROBEVERIFIED | WHEN: $(date +%s%N)"
 
-      - name: Boot VM (LOB disk + mirror media, VNC 5900)
+      - name: Boot VM (LOB disk, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 8192 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
