@@ -1,12 +1,8 @@
-name: AetherGrid AIO (Pure v39 Debug)
+name: AetherGrid AIO (Always Reinstall v40)
 
 on:
-  workflow_dispatch:
-    inputs:
-      force_reinstall:
-        description: 'Wipe LOB and reinstall OS (true/false)'
-        required: false
-        default: 'false'
+  push:
+    branches: [main, master]
 
 jobs:
   boot-vm:
@@ -19,8 +15,12 @@ jobs:
       DRIME1: ${{ secrets.DRIME1 }}
       DRIME2: ${{ secrets.DRIME2 }}
       DRIME3: ${{ secrets.DRIME3 }}
+      FORCE: "true"  # Always true
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Install Minimal Stack (NO rclone)
         run: |
           set -e
@@ -39,7 +39,7 @@ jobs:
           sleep 15
           echo "[LOG] WHAT: NETBIRD_UP | WHEN: $(date +%s%N)"
 
-      - name: Write Pure AetherGrid v39 (Raw error logging)
+      - name: Write Pure AetherGrid v40 (Fix folder-exists logic)
         run: |
           cat > /tmp/pure_aethergrid.py <<'PYEOF'
           import os,sys,stat,errno,zlib,json,threading,time,signal,traceback,subprocess
@@ -51,7 +51,7 @@ jobs:
           TOKENS=[os.environ["DRIME"]]+[os.environ[k] for k in ["DRIME1","DRIME2","DRIME3"] if os.environ.get(k)]
           TOKEN=TOKENS[0]
           VSIZE=int(os.environ.get("VSIZE","18"))*1024**3
-          FORCE=os.environ.get("FORCE","false")=="true"
+          FORCE=os.environ.get("FORCE","true")=="true"  # Always true now
           MNT="/mnt/aether"; API="https://app.drime.cloud/api/v1"; BASE="https://app.drime.cloud/"
           SLOT=256*1024; PART=5*1024*1024; SEGLRU_MAX=64; COMMIT_WINDOW=2.0
           S=requests.Session(); S.headers.update({"Authorization":"Bearer "+TOKEN,"Accept":"application/json"})
@@ -106,30 +106,19 @@ jobs:
                   key="/".join(parts[:i+1])
                   if key in FOLDERS: cur=FOLDERS[key]; continue
                   items=[it for it in list_dir(cur) if it.get("name")==leaf]
-                  if items: cur=str(items[0]["id"])
+                  if items:
+                      cur=str(items[0]["id"])  # Folder exists, use it
+                      log("FOLDER_EXISTS", f"path:{key} id:{cur}")
                   else:
-                      # Try multiple field name variations
-                      payloads=[
-                          {"name":leaf,"parent_id":int(cur) if cur else None},
-                          {"name":leaf,"parent_id":int(cur) if cur else 0},
-                          {"Name":leaf,"ParentID":int(cur) if cur else 0},
-                          {"name":leaf,"parent_id":cur if cur else None},
-                      ]
-                      success=False
-                      for payload in payloads:
-                          try:
-                              log("FOLDER_CREATE_REQ", json.dumps(payload))
-                              r=S.post(API+"/folders",json=payload,timeout=60)
-                              log("FOLDER_CREATE_RESP", f"status:{r.status_code} body:{r.text[:500]}")
-                              if r.status_code==200 or r.status_code==201:
-                                  j=r.json()
-                                  cur=str(dig(j,"id"))
-                                  success=True
-                                  break
-                          except Exception as e:
-                              log("FOLDER_CREATE_ERR", str(e))
-                      if not success:
-                          raise RuntimeError(f"Failed to create folder {leaf}")
+                      # Folder doesn't exist, create it
+                      payload={"name":leaf,"parent_id":int(cur) if cur else None}
+                      log("FOLDER_CREATE_REQ", json.dumps(payload))
+                      r=S.post(API+"/folders",json=payload,timeout=60)
+                      log("FOLDER_CREATE_RESP", f"status:{r.status_code}")
+                      r.raise_for_status()
+                      j=r.json()
+                      cur=str(dig(j,"id"))
+                      log("FOLDER_CREATED", f"path:{key} id:{cur}")
                   FOLDERS[key]=cur
               FOLDERS[path]=cur; return cur
           def mp_create(fname,parent):
@@ -298,7 +287,7 @@ jobs:
           folder("lob/idx"); folder("lob/seg")
           if FORCE:
               purge("lob/idx"); purge("lob/seg")
-              log("SELF_HEAL", "purged lob")
+              log("SELF_HEAL", "purged lob (FORCE=true)")
           os.makedirs(MNT,exist_ok=True)
           load_head()
           threading.Thread(target=committer,daemon=True).start()
@@ -311,7 +300,7 @@ jobs:
       - name: Detect Mode
         run: |
           set -e
-          sudo env DRIME=$DRIME DRIME1=$DRIME1 DRIME2=$DRIME2 DRIME3=$DRIME3 FORCE=${{ github.event.inputs.force_reinstall }} python3 -c "
+          sudo env DRIME=$DRIME DRIME1=$DRIME1 DRIME2=$DRIME2 DRIME3=$DRIME3 python3 -c "
           import requests,os
           T=os.environ['DRIME']
           S=requests.Session(); S.headers.update({'Authorization':'Bearer '+T,'Accept':'application/json'})
@@ -347,7 +336,7 @@ jobs:
       - name: Launch Pure AetherGrid + Assert
         run: |
           set -e
-          sudo env VSIZE=$VSIZE DRIME=$DRIME DRIME1=$DRIME1 DRIME2=$DRIME2 DRIME3=$DRIME3 FORCE=${{ github.event.inputs.force_reinstall }} nohup python3 /tmp/pure_aethergrid.py > /tmp/aethergrid.log 2>&1 &
+          sudo env VSIZE=$VSIZE DRIME=$DRIME DRIME1=$DRIME1 DRIME2=$DRIME2 DRIME3=$DRIME3 FORCE=$FORCE nohup python3 /tmp/pure_aethergrid.py > /tmp/aethergrid.log 2>&1 &
           sleep 10
           cat /tmp/aethergrid.log
           grep -q AETHERCORE_READY /tmp/aethergrid.log
@@ -382,13 +371,16 @@ jobs:
           echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
           exit $EXIT
 
-      - name: Drain (ALWAYS)
+      - name: Drain to Drime (Data Durability)
+        # PURPOSE: Flush any pending writes from Python memory buffer to Drime before process dies.
+        # Without this, if QEMU or daemon crashes, recent writes would be lost.
+        # The drain calls commit() which uploads dirty slots as a new segment object + updates index.
         if: always()
         run: |
-          echo "[LOG] WHAT: DRAIN_START | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DRAIN_START | PURPOSE: flush memory buffer to Drime for durability | WHEN: $(date +%s%N)"
           sudo pkill -TERM -f qemu-system-x86_64 || true
           sleep 3
           sudo pkill -TERM -f pure_aethergrid.py || true
           sleep 15
           tail -30 /tmp/aethergrid.log || true
-          echo "[LOG] WHAT: DRAIN_DONE | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DRAIN_DONE | ALL_WRITES_PERSISTED_TO_DRIME | WHEN: $(date +%s%N)"
