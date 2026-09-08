@@ -1,4 +1,4 @@
-name: AetherGrid AIO (AetherShard v16)
+name: AetherGrid AIO (AetherShard v17)
 
 on:
   workflow_dispatch:
@@ -63,14 +63,22 @@ jobs:
           chmod 600 $CONF
           echo "REMOTE=$REMOTE" >> $GITHUB_ENV
           echo "ACCOUNTS=$N"    >> $GITHUB_ENV
-          echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | REMOTE: $REMOTE | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | WHEN: $(date +%s%N)"
+
+      - name: Create Real Parent Folders (parentId Fix)
+        run: |
+          set -e
+          rclone mkdir --config /tmp/rclone.conf "${REMOTE}:vm"  || true
+          rclone mkdir --config /tmp/rclone.conf "${REMOTE}:iso" || true
+          echo "[LOG] WHAT: PARENT_FOLDERS_READY | vm/ + iso/ | WHEN: $(date +%s%N)"
 
       - name: Self-Heal + Mode + Virtual Size
         run: |
           set -e
           if [ "${{ github.event.inputs.force_reinstall }}" = "true" ]; then
             rclone purge --config /tmp/rclone.conf "${REMOTE}:vm" || true
-            echo "[LOG] WHAT: SELF_HEAL | purged vm shards | WHEN: $(date +%s%N)"
+            rclone mkdir --config /tmp/rclone.conf "${REMOTE}:vm" || true
+            echo "[LOG] WHAT: SELF_HEAL | purged+recreated vm/ | WHEN: $(date +%s%N)"
           fi
           EXIST=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | head -1 || true)
           if [ -n "$EXIST" ]; then
@@ -84,20 +92,26 @@ jobs:
           echo "VSIZE=$VSIZE" >> $GITHUB_ENV
           echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Stream ISO To Drime (rcat pipe, zero local)
+      - name: Stream ISO To Drime iso/ (rcat pipe) + HTTPS Fallback Flag
         if: env.MODE == 'FIRST'
         run: |
-          set -e
-          HAS=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:" 2>/dev/null | grep -c '^ubuntu.iso$' || true)
-          if [ "${HAS:-0}" = "0" ]; then
-            echo "[LOG] WHAT: ISO_STREAM_TO_DRIME | VIA: rcat pipe | WHEN: $(date +%s%N)"
-            wget -qO- "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" \
-              | rclone --config /tmp/rclone.conf rcat "${REMOTE}:ubuntu.iso"
+          HAS=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:iso" 2>/dev/null | grep -c '^ubuntu.iso$' || true)
+          if [ "${HAS:-0}" != "0" ]; then
+            echo "ISO_SRC=drime" >> $GITHUB_ENV
+            echo "[LOG] WHAT: ISO_REUSE | FROM: Drime iso/ | WHEN: $(date +%s%N)"
           else
-            echo "[LOG] WHAT: ISO_REUSE | FROM: Drime | WHEN: $(date +%s%N)"
+            echo "[LOG] WHAT: ISO_STREAM_TO_DRIME | VIA: rcat into iso/ | WHEN: $(date +%s%N)"
+            if wget -qO- "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" \
+               | rclone --config /tmp/rclone.conf rcat "${REMOTE}:iso/ubuntu.iso"; then
+              echo "ISO_SRC=drime" >> $GITHUB_ENV
+              echo "[LOG] WHAT: ISO_ON_DRIME | WHEN: $(date +%s%N)"
+            else
+              echo "ISO_SRC=https" >> $GITHUB_ENV
+              echo "[LOG] WHAT: ISO_FALLBACK | WHY: drime multipart refused | SRC: https direct | WHEN: $(date +%s%N)"
+            fi
           fi
 
-      - name: Mount Drime Read-Only Path (cache-off)
+      - name: Mount Drime Read Path (cache-off)
         run: |
           set -e
           sudo mkdir -p /mnt/drime
@@ -107,7 +121,7 @@ jobs:
             --allow-other --log-level INFO --daemon
           sleep 8
           mountpoint -q /mnt/drime
-          echo "[LOG] WHAT: DRIME_MOUNT_OK | READ_PATH: cache-off | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DRIME_MOUNT_OK | WHEN: $(date +%s%N)"
 
       - name: Write AetherShard Daemon
         run: |
@@ -203,7 +217,7 @@ jobs:
               conn,_=srv.accept(); threading.Thread(target=handle,args=(conn,),daemon=True).start()
           PYEOF
           python3 -m py_compile /tmp/aethershard.py
-          echo "[LOG] WHAT: DAEMON_WRITTEN_AND_COMPILED | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DAEMON_COMPILED | WHEN: $(date +%s%N)"
 
       - name: Launch Daemon + Assert Alive
         run: |
@@ -215,13 +229,18 @@ jobs:
           (exec 3<>/dev/tcp/127.0.0.1/10809) 2>/dev/null || { echo "[LOG] WHAT: NBD_PORT_DEAD | WHEN: $(date +%s%N)"; exit 1; }
           echo "[LOG] WHAT: DAEMON_ALIVE | NBD: 10809 | WHEN: $(date +%s%N)"
 
-      - name: Boot VM (Disk = Drime Shards via NBD, VNC 5900)
+      - name: Boot VM (Disk = Drime Shards, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 12288 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
-          ARGS="$ARGS -drive file=nbd:127.0.0.1:10809,if=virtio,format=raw,cache=none"
-          if [ "$MODE" = "FIRST" ]; then ARGS="$ARGS -boot order=dc -cdrom /mnt/drime/ubuntu.iso"; else ARGS="$ARGS -boot order=c"; fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | DISK: NBD->Drime | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          ARGS="$ARGS -drive file=nbd:127.0.0.1:10809,if=virtio,format=qcow2,cache=none"
+          if [ "$MODE" = "FIRST" ]; then
+            if [ "$ISO_SRC" = "drime" ]; then ARGS="$ARGS -boot order=dc -cdrom /mnt/drime/iso/ubuntu.iso"
+            else ARGS="$ARGS -boot order=dc -cdrom https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; fi
+          else
+            ARGS="$ARGS -boot order=c"
+          fi
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | ISO_SRC: $ISO_SRC | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
           ( while true; do sleep 300; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
             free -h | head -2 || true; \
@@ -247,7 +266,7 @@ jobs:
           tail -5 /tmp/aethershard.log || true
           echo "[LOG] WHAT: FINAL_SHARDS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
           if [ "$MODE" = "FIRST" ] && [ "$VMEXIT" = "0" ] && [ "$ACCOUNTS" -eq 1 ]; then
-            rclone deletefile --config /tmp/rclone.conf "${REMOTE}:ubuntu.iso" || true
+            rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
             echo "[LOG] WHAT: ISO_CLEANUP | quota freed for 18G | WHEN: $(date +%s%N)"
           fi
           sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
