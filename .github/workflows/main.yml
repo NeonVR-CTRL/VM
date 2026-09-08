@@ -65,15 +65,15 @@ jobs:
           echo "ACCOUNTS=$N"    >> $GITHUB_ENV
           echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | REMOTE: $REMOTE | WHEN: $(date +%s%N)"
 
-      - name: Self-Heal + Virtual Size
+      - name: Self-Heal + Mode + Virtual Size
         run: |
           set -e
           FORCE="${{ github.event.inputs.force_reinstall }}"
           if [ "$FORCE" = "true" ]; then
-            rclone purge --config /tmp/rclone.conf "${REMOTE}:vm" || true
+            rclone --config /tmp/rclone.conf purge "${REMOTE}:vm" || true
             echo "[LOG] WHAT: SELF_HEAL | purged vm shards | WHEN: $(date +%s%N)"
           fi
-          EXIST=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | head -1 || true)
+          EXIST=$(rclone --config /tmp/rclone.conf lsf "${REMOTE}:vm" 2>/dev/null | head -1 || true)
           if [ -n "$EXIST" ]; then
             MODE=BOOT
             if [ "$ACCOUNTS" -eq 1 ]; then VSIZE=18; else VSIZE=$((18*ACCOUNTS-4)); fi
@@ -85,21 +85,33 @@ jobs:
           echo "VSIZE=$VSIZE" >> $GITHUB_ENV
           echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Stream ISO To Drime (First Boot Only, Cache-Off)
+      - name: Read-Only Drime Mount (ISO Source)
         run: |
           set -e
           sudo mkdir -p /mnt/drime
           sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
           sudo rclone mount "${REMOTE}:" /mnt/drime \
-            --config /tmp/rclone.conf --vfs-cache-mode off \
+            --config /tmp/rclone.conf --read-only --vfs-cache-mode off \
             --allow-other --log-level INFO --daemon
           sleep 8
-          if [ "$MODE" = "FIRST" ] && [ ! -f /mnt/drime/ubuntu.iso ]; then
-            echo "[LOG] WHAT: ISO_STREAM_TO_DRIME | WHEN: $(date +%s%N)"
-            sudo wget -O /mnt/drime/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" || \
-            sudo wget -O /mnt/drime/ubuntu.iso "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"
+          mountpoint -q /mnt/drime
+          echo "[LOG] WHAT: DRIME_MOUNT_RO | WHEN: $(date +%s%N)"
+
+      - name: Stream ISO To Drime (rcat pipe, no mount writes)
+        run: |
+          set -e
+          if [ "$MODE" = "FIRST" ]; then
+            HASISO=$(rclone --config /tmp/rclone.conf lsf "${REMOTE}:" --include "ubuntu.iso" 2>/dev/null || true)
+            if [ -z "$HASISO" ]; then
+              echo "[LOG] WHAT: ISO_STREAM_RCAT | WHEN: $(date +%s%N)"
+              ( wget -qO- "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" || \
+                wget -qO- "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso" ) | \
+                rclone --config /tmp/rclone.conf rcat "${REMOTE}:ubuntu.iso"
+            else
+              echo "[LOG] WHAT: ISO_REUSE | WHEN: $(date +%s%N)"
+            fi
           fi
-          echo "[LOG] WHAT: ISO_READY | SOURCE: Drime direct | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: ISO_READY | SOURCE: Drime | WHEN: $(date +%s%N)"
 
       - name: Write AetherShard Daemon
         run: |
@@ -112,7 +124,7 @@ SHARD=4*1024*1024; PORT=10809; DIRTY_MAX=256*1024*1024
 RC=["rclone","--config",CONF]
 lock=threading.Lock(); cond=threading.Condition(lock)
 dirty={}; touched={}; uploading={}; stats={"put":0,"get":0,"miss":0}
-STOP=False
+STOP=False; DRAINING=False
 def name(i): return f"vm/shard_{i:06d}"
 def put(i,data):
     p=subprocess.run(RC+["rcat",f"{REMOTE}:{name(i)}"],input=bytes(data),capture_output=True)
@@ -124,21 +136,30 @@ def get(i):
     stats["miss"]+=1; return None
 def uploader():
     pool=ThreadPoolExecutor(4)
+    futs={}
     while True:
         with lock:
-            now=time.time(); cands=[i for i in dirty if now-touched[i]>2.0]
-            for i in cands: uploading[i]=dirty.pop(i)
-        for i in list(uploading):
-            fut=pool.submit(put,i,uploading[i])
-            def done(fut,i=i):
+            now=time.time()
+            cands=[i for i in dirty if DRAINING or now-touched[i]>2.0]
+            for i in cands:
+                if i not in futs:
+                    uploading[i]=dirty.pop(i)
+            if STOP and not dirty and not uploading and not futs: return
+        for i in list(futs):
+            if futs[i].done():
+                ok=futs[i].result()
                 with lock:
-                    if fut.result():
-                        stats["put"]+=1; uploading.pop(i,None); cond.notify_all()
-                    else:
-                        dirty.setdefault(i,uploading.pop(i,None)); touched[i]=time.time()
-            fut.add_done_callback(done)
-        time.sleep(0.5)
+                    if ok: stats["put"]+=1; uploading.pop(i,None)
+                    else: dirty.setdefault(i,uploading.pop(i,None)); touched[i]=time.time()
+                futs.pop(i)
+        with lock:
+            for i in list(uploading):
+                if i not in futs and len(futs)<4:
+                    futs[i]=pool.submit(put,i,uploading[i])
+        time.sleep(0.3)
 def drain():
+    global DRAINING
+    with lock: DRAINING=True
     while True:
         with lock:
             if not dirty and not uploading: return
@@ -150,6 +171,7 @@ def shard_buf(i):
     b=get(i)
     if b is None: b=bytearray(SHARD)
     with lock:
+        if i in dirty: return dirty[i]
         dirty[i]=b; touched[i]=time.time()
     return b
 def write_at(off,data):
@@ -168,74 +190,72 @@ def read_at(off,length):
         b=shard_buf(i); out+=b[s:s+n]; off+=n; pos+=n
     return bytes(out)
 def handle(conn):
-    f=conn.makefile("rwb")
-    f.write(b"NBDMAGIC"+struct.pack(">Q",0x49484156454f5054)+struct.pack(">H",0)); f.flush()
-    opt=struct.unpack(">I",f.read(4))[0]
-    ln=struct.unpack(">I",f.read(4))[0]; f.read(ln)
-    f.write(struct.pack(">Q",VSIZE)+struct.pack(">I",0x0005)+b"\x00"*124); f.flush()
-    while True:
-        hdr=f.read(28)
-        if len(hdr)<28: return
-        magic,typ,handle,off,ln=struct.unpack(">IIQQI",hdr)
-        if typ==0:
-            d=read_at(off,ln)
-            f.write(struct.pack(">IIQ",0x67446698,0,handle)+d); f.flush()
-        elif typ==1:
-            d=f.read(ln); write_at(off,d)
-            f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
-        elif typ==2:
-            drain()
-            f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
-        elif typ in (3,4,5):
-            f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
+    try:
+        f=conn.makefile("rwb")
+        f.write(b"NBDMAGIC"+struct.pack(">Q",0x49484156454f5054)+struct.pack(">H",0)); f.flush()
+        f.read(4)
+        opt=struct.unpack(">I",f.read(4))[0]; ln=struct.unpack(">I",f.read(4))[0]; f.read(ln)
+        if opt!=1: return
+        f.write(struct.pack(">Q",VSIZE)+struct.pack(">H",0x0005)+b"\x00"*124); f.flush()
+        while True:
+            hdr=f.read(28)
+            if len(hdr)<28: return
+            magic,typ,handle,off,ln=struct.unpack(">IIQQI",hdr)
+            if typ==0:
+                d=read_at(off,ln)
+                f.write(struct.pack(">IIQ",0x67446698,0,handle)+d); f.flush()
+            elif typ==1:
+                d=f.read(ln); write_at(off,d)
+                f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
+            elif typ==2:
+                return
+            elif typ==3:
+                drain()
+                f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
+            else:
+                f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
+    except Exception:
+        return
 def on_term(sig,frm):
     global STOP
     STOP=True
-    drain()
-    print(f"[LOG] WHAT: DAEMON_DRAIN | STATS: {stats} | WHEN: {time.time_ns()}",flush=True)
-    os._exit(0)
+    def fin():
+        drain(); os._exit(0)
+    threading.Thread(target=fin).start()
 signal.signal(signal.SIGTERM,on_term); signal.signal(signal.SIGINT,on_term)
 threading.Thread(target=uploader,daemon=True).start()
 srv=socket.socket(); srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-srv.bind(("127.0.0.1",PORT)); srv.listen(1)
-print(f"[LOG] WHAT: AETHERSHARD_READY | PORT: {PORT} | VSIZE: {VSIZE} | WHEN: {time.time_ns()}",flush=True)
+srv.bind(("127.0.0.1",PORT)); srv.listen(2)
+print(f"[LOG] WHAT: AETHERSHARD_READY | PORT: {PORT} | VSIZE: {VSIZE} | SHARD: 4M | WHEN: {time.time_ns()}",flush=True)
 while True:
     conn,_=srv.accept()
     threading.Thread(target=handle,args=(conn,),daemon=True).start()
 PYEOF
-          echo "[LOG] WHAT: DAEMON_WRITTEN | BYTES: $(wc -c < /tmp/aethershard.py) | WHEN: $(date +%s%N)"
-
-      - name: Compile Gate (Fail Loud On Corruption)
-        run: |
-          set -e
           python3 -m py_compile /tmp/aethershard.py
-          echo "[LOG] WHAT: COMPILE_GATE_PASSED | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DAEMON_WRITTEN_AND_COMPILED | WHEN: $(date +%s%N)"
 
-      - name: Launch AetherShard Daemon
+      - name: Launch Daemon + Alive Assertion
         run: |
           set -e
           REMOTE=$REMOTE VSIZE=$VSIZE nohup python3 /tmp/aethershard.py > /tmp/aethershard.log 2>&1 &
-          sleep 4
-          cat /tmp/aethershard.log
-
-      - name: Assert NBD Port Alive (Fail Loud)
-        run: |
-          set -e
-          if timeout 30 bash -c 'until exec 3<>/dev/tcp/127.0.0.1/10809; do sleep 1; done'; then
-            echo "[LOG] WHAT: NBD_PORT_ALIVE | 127.0.0.1:10809 | WHEN: $(date +%s%N)"
-          else
-            echo "[LOG] WHAT: NBD_PORT_DEAD | DUMPING DAEMON STDERR | WHEN: $(date +%s%N)"
+          for i in $(seq 1 30); do
+            if grep -q AETHERSHARD_READY /tmp/aethershard.log 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if ! grep -q AETHERSHARD_READY /tmp/aethershard.log 2>/dev/null; then
+            echo "[LOG] WHAT: DAEMON_FAIL | WHY: see stderr below | WHEN: $(date +%s%N)"
             cat /tmp/aethershard.log || true
             exit 1
           fi
+          echo "[LOG] WHAT: DAEMON_ALIVE | NBD: 127.0.0.1:10809 | WHEN: $(date +%s%N)"
 
-      - name: Boot VM (Block Device = Drime Shards, VNC 5900)
+      - name: Boot VM (Disk = Drime Shards via NBD, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 12288 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
           ARGS="$ARGS -drive file=nbd:127.0.0.1:10809,if=virtio,format=raw,cache=none"
           if [ "$MODE" = "FIRST" ]; then ARGS="$ARGS -boot order=dc -cdrom /mnt/drime/ubuntu.iso"; else ARGS="$ARGS -boot order=c"; fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | DISK: NBD->Drime shards | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | DISK: NBD->Drime | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
           ( while true; do sleep 300; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
             free -h | head -2 || true; tail -2 /tmp/aethershard.log || true; \
@@ -252,17 +272,15 @@ PYEOF
       - name: Drain Shards + Guarded Cleanup (ALWAYS)
         if: always()
         run: |
-          echo "[LOG] WHAT: DRAIN_START | flushing in-flight shards to Drime | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DRAIN_START | WHEN: $(date +%s%N)"
           sudo pkill -TERM -f qemu-system-x86_64 || true
           sleep 3
           pkill -TERM -f aethershard.py || true
           sleep 15
           tail -5 /tmp/aethershard.log || true
-          if [ "$MODE" = "FIRST" ] && [ "$VMEXIT" = "0" ] && [ "$ACCOUNTS" -eq 1 ]; then
-            sudo rm -f /mnt/drime/ubuntu.iso || true
+          if [ "$MODE" = "FIRST" ] && [ "$VMEXIT" = "0" ] && [ "$ACCOUNTS" = "1" ]; then
+            rclone --config /tmp/rclone.conf deletefile "${REMOTE}:ubuntu.iso" || true
             echo "[LOG] WHAT: ISO_CLEANUP | quota freed | WHEN: $(date +%s%N)"
-          else
-            echo "[LOG] WHAT: ISO_KEPT | WHY: run not clean or multi-account | WHEN: $(date +%s%N)"
           fi
           sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
           echo "[LOG] WHAT: DRAIN_DONE | DRIME_HAS_ALL_SHARDS | WHEN: $(date +%s%N)"
