@@ -1,4 +1,4 @@
-name: AetherGrid AIO (AetherCore v35 GroupCommit)
+name: AetherGrid AIO (AetherCore v36 Native)
 
 on:
   workflow_dispatch:
@@ -30,8 +30,8 @@ jobs:
             qemu-system-x86 qemu-utils qemu-system-common qemu-block-extra fuse3 libfuse2 wget curl ca-certificates python3 python3-pip
           curl https://rclone.org/install.sh | sudo bash
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
-          sudo pip3 install --break-system-packages fusepy
-          sudo python3 -c "import fuse; print('fusepy OK (root)')"
+          sudo pip3 install --break-system-packages fusepy requests
+          sudo python3 -c "import fuse,requests; print('deps OK')"
           echo "[LOG] WHAT: INSTALL_DONE | WHEN: $(date +%s%N)"
 
       - name: NetBird Mesh Up
@@ -41,7 +41,7 @@ jobs:
           sleep 15
           echo "[LOG] WHAT: NETBIRD_UP | WHEN: $(date +%s%N)"
 
-      - name: Build Drime Config
+      - name: Build rclone Config (control plane only)
         run: |
           set -e
           CONF=/tmp/rclone.conf; : > $CONF
@@ -71,9 +71,12 @@ jobs:
         run: |
           set -e
           rclone mkdir --config /tmp/rclone.conf "${REMOTE}:lob" || true
+          rclone mkdir --config /tmp/rclone.conf "${REMOTE}:lob/idx" || true
+          rclone mkdir --config /tmp/rclone.conf "${REMOTE}:lob/seg" || true
           if [ "${{ github.event.inputs.force_reinstall }}" = "true" ]; then
             rclone purge --config /tmp/rclone.conf "${REMOTE}:lob" || true
-            rclone mkdir --config /tmp/rclone.conf "${REMOTE}:lob" || true
+            rclone mkdir --config /tmp/rclone.conf "${REMOTE}:lob/idx" || true
+            rclone mkdir --config /tmp/rclone.conf "${REMOTE}:lob/seg" || true
             echo "[LOG] WHAT: SELF_HEAL | purged lob/ | WHEN: $(date +%s%N)"
           fi
           IDX=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/idx/" 2>/dev/null | head -1 || true)
@@ -83,7 +86,7 @@ jobs:
           echo "VSIZE=$VSIZE" >> $GITHUB_ENV
           echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Resolve Media (Mirror first)
+      - name: Resolve Media (mirror)
         if: env.MODE == 'FIRST'
         run: |
           set -e
@@ -92,116 +95,182 @@ jobs:
                    "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; do
             if curl -sfI "$u" | head -1 | grep -qE "HTTP/[^ ]+ (200|302)"; then ISO_URL=$u; break; fi
           done
-          if [ -n "$ISO_URL" ]; then
-            echo "CDROM=$ISO_URL" >> $GITHUB_ENV; echo "MEDIASRC=https" >> $GITHUB_ENV; echo "HAS_ISO=false" >> $GITHUB_ENV
-            rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
-            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: mirror | WHEN: $(date +%s%N)"
-          else
-            echo "[LOG] WHAT: MEDIA_DEAD | no mirror reachable | WHEN: $(date +%s%N)"; exit 1
-          fi
+          [ -n "$ISO_URL" ] || { echo "[LOG] WHAT: MEDIA_DEAD | WHEN: $(date +%s%N)"; exit 1; }
+          echo "CDROM=$ISO_URL" >> $GITHUB_ENV
+          rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
+          echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: mirror | WHEN: $(date +%s%N)"
 
-      - name: BOOT mode inherits no-iso
-        if: env.MODE == 'BOOT'
-        run: echo "HAS_ISO=false" >> $GITHUB_ENV
-
-      - name: Mount Drime (write-once transport)
-        run: |
-          set -e
-          sudo mkdir -p /mnt/drime /ramdisk
-          sudo mount -t tmpfs -o size=600M tmpfs /ramdisk
-          sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
-          sudo rclone mount "${REMOTE}:" /mnt/drime \
-            --config /tmp/rclone.conf \
-            --vfs-cache-mode writes \
-            --vfs-cache-max-size 512M \
-            --cache-dir /ramdisk \
-            --transfers 8 \
-            --allow-other --log-level INFO --daemon
-          sleep 8
-          mountpoint -q /mnt/drime
-          echo "[LOG] WHAT: TRANSPORT_MOUNT_OK | WHEN: $(date +%s%N)"
-
-      - name: Write AetherCore v35 (GroupCommit log segments)
+      - name: Write AetherCore v36 (Native Drime client)
         run: |
           cat > /tmp/aethercore.py <<'PYEOF'
-          import os,stat,errno,hashlib,zlib,json,threading,time,signal,traceback
+          import os,stat,errno,zlib,json,threading,time,signal,traceback
           from collections import OrderedDict
+          from concurrent.futures import ThreadPoolExecutor
+          import requests
           from fuse import FUSE, FuseOSError, Operations
-          ROOT="/mnt/drime/lob"; MNT="/mnt/aether"
-          VSIZE=int(os.environ["VSIZE"])*1024**3
-          SLOT=256*1024
-          SEGLRU_MAX=64
+          TOKEN=os.environ["DRIME_TOKEN"]; VSIZE=int(os.environ["VSIZE"])*1024**3
+          MNT="/mnt/aether"; API="https://app.drime.cloud/api/v1"; BASE="https://app.drime.cloud/"
+          SLOT=256*1024; PART=5*1024*1024; SEGLRU_MAX=64; COMMIT_WINDOW=2.0
+          S=requests.Session(); S.headers.update({"Authorization":"Bearer "+TOKEN,"Accept":"application/json"})
+          pool=ThreadPoolExecutor(8)
           lock=threading.Lock(); commit_req=threading.Event(); commit_done=threading.Event()
-          index={}; buf={}; bufgen=[0]; segseq=[0]; idxseq=[0]; commits_since_idx=[0]
-          seglru=OrderedDict()
+          index={}; buf={}; segseq=[0]; idxseq=[0]; seglru=OrderedDict(); segurl={}
+          RAWLOGGED=set()
+          def log(w,v): print(f"[LOG] WHAT: {w} | {v} | WHEN: {time.time_ns()}",flush=True)
+          def raw(tag,j):
+              if tag not in RAWLOGGED:
+                  RAWLOGGED.add(tag); log("RAW_"+tag, json.dumps(j)[:900])
+          def walk(o):
+              st=[o]
+              while st:
+                  c=st.pop()
+                  if isinstance(c,dict):
+                      yield c; st.extend(c.values())
+                  elif isinstance(c,list): st.extend(c)
+          def find_items(o):
+              st=[o]
+              while st:
+                  c=st.pop()
+                  if isinstance(c,list) and c and all(isinstance(x,dict) and "id" in x and "name" in x for x in c): return c
+                  if isinstance(c,dict): st.extend(c.values())
+                  elif isinstance(c,list): st.extend(c)
+              return []
+          def dig(o,*keys):
+              for d in walk(o):
+                  for kk,vv in d.items():
+                      if kk.lower() in keys: return vv
+              return None
+          def digurl(o):
+              for d in walk(o):
+                  for kk,vv in d.items():
+                      if isinstance(vv,str) and ("url" in kk.lower() or kk.lower()=="link") and (vv.startswith("/") or vv.startswith("http")): return vv
+              return None
+          def list_dir(fid):
+              out=[]; page=1
+              while True:
+                  r=S.get(API+"/drive/file-entries",params={"folderId":fid,"perPage":200,"page":page},timeout=60)
+                  r.raise_for_status(); j=r.json(); raw("LIST",j)
+                  items=find_items(j); out+=items
+                  if len(items)<200: break
+                  page+=1
+              return out
+          FOLDERS={}
+          def folder(path):
+              if path in FOLDERS: return FOLDERS[path]
+              cur=""
+              for leaf in path.split("/"):
+                  key=path if leaf==path.split("/")[-1] else "/".join(path.split("/")[:path.split("/").index(leaf)+1])
+                  items=[i for i in list_dir(cur) if i.get("name")==leaf]
+                  if items: cur=str(items[0]["id"])
+                  else:
+                      r=S.post(API+"/folders",json={"Name":leaf,"ParentID":cur},timeout=60)
+                      r.raise_for_status(); cur=str(dig(r.json(),"id"))
+                  FOLDERS[key]=cur
+              FOLDERS[path]=cur; return cur
+          def mp_create(fname,parent):
+              r=S.post(API+"/s3/multipart/create",json={"Filename":fname,"Mime":"application/octet-stream","Size":0,"Extension":"bin","ParentID":parent,"RelativePath":fname},timeout=60)
+              r.raise_for_status(); j=r.json(); raw("MPCREATE",j)
+              return str(dig(j,"uploadid","upload_id")), str(dig(j,"key"))
+          def mp_sign(up,key,nums):
+              r=S.post(API+"/s3/multipart/batch-sign-part-urls",json={"UploadID":up,"Key":key,"PartNumbers":nums},timeout=60)
+              r.raise_for_status(); j=r.json(); raw("MPSIGN",j)
+              m={}
+              for d in walk(j):
+                  pn=None; url=None
+                  for k,v in d.items():
+                      if isinstance(v,int) and "part" in k.lower(): pn=v
+                      if isinstance(v,str) and v.startswith("http"): url=v
+                  if pn is not None and url: m[pn]=url
+              return m
+          def mp_put(url,data):
+              r=requests.put(url,data=data,headers={"Content-Type":"application/octet-stream"},timeout=120)
+              r.raise_for_status(); return r.headers.get("ETag","")
+          def mp_complete(up,key,parts):
+              r=S.post(API+"/s3/multipart/complete",json={"UploadID":up,"Key":key,"Parts":parts},timeout=120)
+              r.raise_for_status(); j=r.json(); raw("MPCOMPLETE",j)
+              return j
+          def upload_blob(name,data,parent):
+              up,key=mp_create(name,parent)
+              nparts=max(1,(len(data)+PART-1)//PART)
+              urls=mp_sign(up,key,list(range(1,nparts+1)))
+              parts=[]
+              def do(pn):
+                  chunk=data[(pn-1)*PART:pn*PART]
+                  et=mp_put(urls[pn],chunk)
+                  return {"PartNumber":pn,"ETag":et}
+              futs=[pool.submit(do,pn) for pn in range(1,nparts+1)]
+              for f in futs: parts.append(f.result())
+              parts.sort(key=lambda p:p["PartNumber"])
+              j=mp_complete(up,key,parts)
+              u=digurl(j)
+              return u
           def load_head():
-              try: names=sorted(os.listdir(ROOT+"/idx"))
-              except FileNotFoundError: names=[]
+              fid=folder("lob/idx")
+              names=sorted(i["name"] for i in list_dir(fid))
               if not names: return
-              idxseq[0]=int(names[-1])
-              with open(ROOT+"/idx/"+names[-1],"rb") as f: raw=f.read()
-              d=json.loads(zlib.decompress(raw))
+              idxseq[0]=int(names[-1].split(".")[0]) if names[-1].split(".")[0].isdigit() else 0
+              it=[i for i in list_dir(fid) if i["name"]==names[-1]][0]
+              u=it.get("url") or digurl(it)
+              r=S.get(BASE+u if u.startswith("/") else u,timeout=120); r.raise_for_status()
+              d=json.loads(zlib.decompress(r.content))
               index.update(d["index"]); segseq[0]=d.get("segseq",0)
-              print(f"[LOG] WHAT: HEAD_LOADED | IDX: {idxseq[0]} | SEG: {segseq[0]} | SLOTS: {len(index)} | WHEN: {time.time_ns()}",flush=True)
-          def seg_payload(seq):
+              for k,v in d.get("segurls",{}).items(): segurl[k]=v
+              log("HEAD_LOADED", f"IDX:{idxseq[0]} SEG:{segseq[0]} SLOTS:{len(index)}")
+          def checkpoint():
               with lock:
-                  if seq in seglru: seglru.move_to_end(seq); return seglru[seq]
-              with open(f"{ROOT}/log/{seq:010d}","rb") as f: raw=f.read()
-              d=zlib.decompress(raw)
-              with lock:
-                  seglru[seq]=d; seglru.move_to_end(seq)
-                  while len(seglru)>SEGLRU_MAX: seglru.popitem(last=False)
-              return d
+                  idxseq[0]+=1; s=idxseq[0]
+                  snap={"index":dict(index),"segseq":segseq[0],"segurls":dict(segurl)}
+              rawb=zlib.compress(json.dumps(snap).encode(),6)
+              upload_blob(f"{s:010d}.idx",rawb,folder("lob/idx"))
           def commit():
               with lock:
                   slots=list(buf.keys())
                   if not slots: return False
-                  parts=[]; table={}
-                  off=0
+                  table={}; chunks=[]; off=0
                   for s in slots:
-                      c=zlib.compress(bytes(buf[s]),1)
-                      table[s]=[off,len(c)]; parts.append(c); off+=len(c)
-                  payload=zlib.compress(json.dumps(table).encode()+b"|"+b"".join(parts),1)
-                  segseq[0]+=1; seq=segseq[0]
-                  for s in slots: index[str(s)]=f"{seq}:{table[s][0]}:{table[s][1]}"
+                      c=zlib.compress(bytes(buf[s]),1); table[s]=[off,len(c)]; chunks.append(c); off+=len(c)
                   buf.clear()
-              p=f"{ROOT}/log/{seq:010d}"
-              fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o644); os.write(fd,payload); os.close(fd)
-              with lock: commits_since_idx[0]+=1
-              if commits_since_idx[0]>=20:
-                  commits_since_idx[0]=0
-                  checkpoint()
+                  segseq[0]+=1; seq=segseq[0]; name=f"seg{seq:010d}.bin"
+                  for s in slots: index[str(s)]=f"{seq}:{table[s][0]}:{table[s][1]}"
+              payload=b"".join(chunks)
+              u=upload_blob(name,payload,folder("lob/seg"))
+              with lock: segurl[str(seq)]=u or ""
+              checkpoint()
               return True
-          def checkpoint():
-              with lock:
-                  idxseq[0]+=1; s=idxseq[0]
-                  snap={"index":dict(index),"segseq":segseq[0]}
-              raw=zlib.compress(json.dumps(snap).encode(),6)
-              p=f"{ROOT}/idx/{s:010d}"
-              fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o644); os.write(fd,raw); os.close(fd)
           def committer():
               while True:
-                  commit_req.wait(0.2)
+                  commit_req.wait(COMMIT_WINDOW)
                   commit_req.clear()
                   try:
-                      if commit(): commit_done.set()
-                      else: commit_done.set()
+                      commit(); commit_done.set()
                   except Exception:
                       traceback.print_exc(); commit_done.set()
           def drain():
               with lock: need=len(buf)>0
               if not need: return
-              commit_done.clear(); commit_req.set()
-              commit_done.wait(60)
+              commit_done.clear(); commit_req.set(); commit_done.wait(120)
+          def seg_bytes(seq):
+              with lock:
+                  if seq in seglru: seglru.move_to_end(seq); return seglru[seq]
+                  u=segurl.get(str(seq),"")
+              if not u:
+                  it=[i for i in list_dir(folder("lob/seg")) if i["name"]==f"seg{seq:010d}.bin"]
+                  u=it[0].get("url") or digurl(it[0]) if it else ""
+                  with lock: segurl[str(seq)]=u
+              r=S.get(BASE+u if u.startswith("/") else u,timeout=120); r.raise_for_status()
+              d=r.content
+              with lock:
+                  seglru[seq]=d; seglru.move_to_end(seq)
+                  while len(seglru)>SEGLRU_MAX: seglru.popitem(last=False)
+              return d
           def read_slot(slot):
               with lock:
                   if slot in buf: return bytes(buf[slot])
                   ptr=index.get(str(slot))
                   if ptr is None: return b"\x00"*SLOT
               seq,off,ln=map(int,ptr.split(":"))
-              pay=seg_payload(seq)
-              c=pay[off:off+ln]
-              return zlib.decompress(c)
+              pay=seg_bytes(seq)
+              return zlib.decompress(pay[off:off+ln])
           def write_at(off,data):
               pos=0
               while pos<len(data):
@@ -237,18 +306,17 @@ jobs:
               def fsync(self,path,datasync,fh):
                   drain(); return 0
               def release(self,path,fh):
-                  drain(); checkpoint(); return 0
+                  drain(); return 0
               def statfs(self,path):
                   return dict(f_bsize=4096,f_frsize=4096,f_blocks=VSIZE//4096,f_bfree=0,f_bavail=0)
               def truncate(self,path,length,fh=None): return 0
           def on_term(sig,frm):
-              threading.Thread(target=lambda:(drain(),checkpoint(),os._exit(0))).start()
+              threading.Thread(target=lambda:(drain(),os._exit(0))).start()
           signal.signal(signal.SIGTERM,on_term); signal.signal(signal.SIGINT,on_term)
-          os.makedirs(ROOT+"/log",exist_ok=True); os.makedirs(ROOT+"/idx",exist_ok=True)
           os.makedirs(MNT,exist_ok=True)
           load_head()
           threading.Thread(target=committer,daemon=True).start()
-          print(f"[LOG] WHAT: AETHERCORE_READY | MNT: {MNT} | VSIZE: {VSIZE} | GROUPCOMMIT: ON | WHEN: {time.time_ns()}",flush=True)
+          log("AETHERCORE_READY", f"MNT:{MNT} VSIZE:{VSIZE} NATIVE:ON")
           FUSE(AetherFS(),MNT,foreground=True,direct_io=True,allow_other=True,nothreads=False)
           PYEOF
           python3 -m py_compile /tmp/aethercore.py
@@ -257,8 +325,8 @@ jobs:
       - name: Launch AetherCore + Assert
         run: |
           set -e
-          sudo env VSIZE=$VSIZE nohup python3 /tmp/aethercore.py > /tmp/aethercore.log 2>&1 &
-          sleep 8
+          sudo env VSIZE=$VSIZE DRIME_TOKEN=$DRIME nohup python3 /tmp/aethercore.py > /tmp/aethercore.log 2>&1 &
+          sleep 10
           cat /tmp/aethercore.log
           grep -q AETHERCORE_READY /tmp/aethercore.log
           mountpoint -q /mnt/aether || { echo "[LOG] WHAT: AETHER_MOUNT_DEAD | WHEN: $(date +%s%N)"; exit 1; }
@@ -277,11 +345,11 @@ jobs:
           ARGS="-m 8192 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
           ARGS="$ARGS -drive file=/mnt/aether/disk.img,if=virtio,format=raw,cache=none"
           if [ "$MODE" = "FIRST" ]; then ARGS="$ARGS -boot order=dc -cdrom $CDROM"; else ARGS="$ARGS -boot order=c"; fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | MEDIA: $MEDIASRC | DISK: LOB-GroupCommit | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | DISK: LOB-Native | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
           ( while true; do sleep 300; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
             free -h | head -2 || true; \
-            echo "[LOG] WHAT: LOG_SEGS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/log/" 2>/dev/null | wc -l) | IDX: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/idx/" 2>/dev/null | tail -1) | WHEN: $(date +%s%N)"; \
+            echo "[LOG] WHAT: SEGS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/seg/" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"; \
           done ) &
           HB=$!
           sudo qemu-system-x86_64 $ARGS &
@@ -300,8 +368,7 @@ jobs:
           sleep 3
           sudo pkill -TERM -f aethercore.py || true
           sleep 15
-          tail -20 /tmp/aethercore.log || true
-          echo "[LOG] WHAT: FINAL_SEGS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/log/" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
+          tail -30 /tmp/aethercore.log || true
+          echo "[LOG] WHAT: FINAL_SEGS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/seg/" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
           sudo umount /mnt/aether || sudo fusermount3 -u /mnt/aether || true
-          sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
           echo "[LOG] WHAT: DRAIN_DONE | WHEN: $(date +%s%N)"
