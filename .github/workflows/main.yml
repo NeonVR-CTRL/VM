@@ -1,4 +1,4 @@
-name: AetherGrid AIO (AetherCore v32)
+name: AetherGrid AIO (AetherCore v33)
 
 on:
   workflow_dispatch:
@@ -83,6 +83,27 @@ jobs:
           echo "VSIZE=$VSIZE" >> $GITHUB_ENV
           echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
 
+      - name: Resolve Media (Mirror first, Drime proxy fallback) + Free Quota
+        if: env.MODE == 'FIRST'
+        run: |
+          set -e
+          ISO_URL=""
+          for u in "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso" \
+                   "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; do
+            if curl -sfI "$u" | head -1 | grep -qE "HTTP/[^ ]+ (200|302)"; then ISO_URL=$u; break; fi
+          done
+          if [ -n "$ISO_URL" ]; then
+            echo "CDROM=$ISO_URL" >> $GITHUB_ENV
+            echo "MEDIASRC=https" >> $GITHUB_ENV
+            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: mirror | DRIME: disk-only | WHEN: $(date +%s%N)"
+            rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
+            echo "[LOG] WHAT: ISO_OBJECT_DELETED | 2.7G quota freed | WHEN: $(date +%s%N)"
+          else
+            echo "CDROM=/mnt/aether/iso.img" >> $GITHUB_ENV
+            echo "MEDIASRC=drime" >> $GITHUB_ENV
+            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: drime proxy 5Mi-aligned | WHEN: $(date +%s%N)"
+          fi
+
       - name: Mount Drime (write-once transport, 512M bounded transit)
         run: |
           set -e
@@ -100,7 +121,7 @@ jobs:
           mountpoint -q /mnt/drime
           echo "[LOG] WHAT: TRANSPORT_MOUNT_OK | WHEN: $(date +%s%N)"
 
-      - name: Write AetherCore LOB Daemon (pread-safe ISO proxy)
+      - name: Write AetherCore LOB Daemon (5Mi-aligned, short-read-safe proxy)
         run: |
           cat > /tmp/aethercore.py <<'PYEOF'
           import os,stat,errno,hashlib,zlib,json,threading,time,signal,traceback
@@ -110,9 +131,10 @@ jobs:
           ROOT="/mnt/drime/lob"; MNT="/mnt/aether"
           VSIZE=int(os.environ["VSIZE"])*1024**3
           SLOT=256*1024
-          LRU_MAX=256*1024*1024//SLOT; ISO_LRU_MAX=256*1024*1024//(4*1024*1024)
-          WIN=4*1024*1024
-          lock=threading.Lock(); cond=threading.Condition(lock)
+          LRU_MAX=256*1024*1024//SLOT
+          WIN=5*1024*1024
+          ISO_LRU_MAX=256*1024*1024//WIN
+          lock=threading.Lock()
           index={}; seq=[0]; buf={}; lru=OrderedDict()
           pool=ThreadPoolExecutor(8)
           ISO_PATH="/mnt/drime/iso/ubuntu.iso"
@@ -189,15 +211,15 @@ jobs:
                   fd=iso_fd[0]
               if w*WIN>=ISO_SIZE[0]: return b""
               chunks=[]; got=0
-              while got<WIN:
-                  c=os.pread(fd, WIN-got, w*WIN+got)
+              while got<WIN and w*WIN+got<ISO_SIZE[0]:
+                  c=os.pread(fd, min(WIN-got, ISO_SIZE[0]-w*WIN-got), w*WIN+got)
                   if not c: break
                   chunks.append(c); got+=len(c)
               d=b"".join(chunks)
               with iso_lock:
                   iso_lru[w]=d; iso_lru.move_to_end(w)
                   while len(iso_lru)>ISO_LRU_MAX: iso_lru.popitem(last=False)
-              for pw in (w+1,w+2,w+3):
+              for pw in (w+1,w+2):
                   if pw*WIN<ISO_SIZE[0]:
                       with iso_lock: pre=pw in iso_lru
                       if not pre: pool.submit(iso_win,pw)
@@ -205,8 +227,11 @@ jobs:
           def iso_read(off,size):
               out=bytearray(); pos=0
               while pos<size:
-                  w=off//WIN; s=off-w*WIN; n=min(WIN-s,size-pos)
-                  out+=iso_win(w)[s:s+n]; off+=n; pos+=n
+                  w=off//WIN; s=off-w*WIN
+                  win=iso_win(w)
+                  chunk=win[s:s+size-pos]
+                  if not chunk: break
+                  out+=chunk; off+=len(chunk); pos+=len(chunk)
               return bytes(out)
           class AetherFS(Operations):
               def getattr(self,path,fh=None):
@@ -275,18 +300,13 @@ jobs:
           qemu-img info /mnt/aether/disk.img
           echo "[LOG] WHAT: DISK_PROBE_VERIFIED | WHEN: $(date +%s%N)"
 
-      - name: Boot VM (LOB disk + pread-safe ISO proxy, VNC 5900)
+      - name: Boot VM (LOB disk + mirror media, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 8192 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
           ARGS="$ARGS -drive file=/mnt/aether/disk.img,if=virtio,format=raw,cache=none"
-          if [ "$MODE" = "FIRST" ]; then
-            if [ -f /mnt/drime/iso/ubuntu.iso ]; then ARGS="$ARGS -boot order=dc -cdrom /mnt/aether/iso.img"
-            else ARGS="$ARGS -boot order=dc -cdrom https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso"; fi
-          else
-            ARGS="$ARGS -boot order=c"
-          fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | DISK: AetherCore LOB | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          if [ "$MODE" = "FIRST" ]; then ARGS="$ARGS -boot order=dc -cdrom $CDROM"; else ARGS="$ARGS -boot order=c"; fi
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | MEDIA: $MEDIASRC | DISK: AetherCore LOB | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
           ( while true; do sleep 300; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
             free -h | head -2 || true; \
@@ -301,7 +321,7 @@ jobs:
           echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
           exit $EXIT
 
-      - name: Drain + ISO Cleanup + Unmount (ALWAYS)
+      - name: Drain + Unmount (ALWAYS)
         if: always()
         run: |
           echo "[LOG] WHAT: DRAIN_START | WHEN: $(date +%s%N)"
@@ -311,10 +331,6 @@ jobs:
           sleep 15
           tail -20 /tmp/aethercore.log || true
           echo "[LOG] WHAT: FINAL_EXTENTS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/ext/" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
-          if [ "$MODE" = "FIRST" ] && [ "$VMEXIT" = "0" ]; then
-            rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
-            echo "[LOG] WHAT: ISO_CLEANUP | quota freed | WHEN: $(date +%s%N)"
-          fi
           sudo umount /mnt/aether || sudo fusermount3 -u /mnt/aether || true
           sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
           echo "[LOG] WHAT: DRAIN_DONE | WHEN: $(date +%s%N)"
