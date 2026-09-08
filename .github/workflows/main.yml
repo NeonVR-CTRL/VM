@@ -1,4 +1,4 @@
-name: AetherGrid AIO (AetherCore v34)
+name: AetherGrid AIO (AetherCore v35 GroupCommit)
 
 on:
   workflow_dispatch:
@@ -83,7 +83,7 @@ jobs:
           echo "VSIZE=$VSIZE" >> $GITHUB_ENV
           echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Resolve Media (Mirror first, Drime proxy fallback)
+      - name: Resolve Media (Mirror first)
         if: env.MODE == 'FIRST'
         run: |
           set -e
@@ -93,22 +93,16 @@ jobs:
             if curl -sfI "$u" | head -1 | grep -qE "HTTP/[^ ]+ (200|302)"; then ISO_URL=$u; break; fi
           done
           if [ -n "$ISO_URL" ]; then
-            echo "CDROM=$ISO_URL" >> $GITHUB_ENV
-            echo "MEDIASRC=https" >> $GITHUB_ENV
-            echo "HAS_ISO=false"  >> $GITHUB_ENV
+            echo "CDROM=$ISO_URL" >> $GITHUB_ENV; echo "MEDIASRC=https" >> $GITHUB_ENV; echo "HAS_ISO=false" >> $GITHUB_ENV
             rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
-            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: mirror | ISO_OBJECT_DELETED | WHEN: $(date +%s%N)"
+            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: mirror | WHEN: $(date +%s%N)"
           else
-            echo "CDROM=/mnt/aether/iso.img" >> $GITHUB_ENV
-            echo "MEDIASRC=drime"            >> $GITHUB_ENV
-            echo "HAS_ISO=true"              >> $GITHUB_ENV
-            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: drime proxy | WHEN: $(date +%s%N)"
+            echo "[LOG] WHAT: MEDIA_DEAD | no mirror reachable | WHEN: $(date +%s%N)"; exit 1
           fi
 
       - name: BOOT mode inherits no-iso
         if: env.MODE == 'BOOT'
-        run: |
-          echo "HAS_ISO=false" >> $GITHUB_ENV
+        run: echo "HAS_ISO=false" >> $GITHUB_ENV
 
       - name: Mount Drime (write-once transport)
         run: |
@@ -127,72 +121,87 @@ jobs:
           mountpoint -q /mnt/drime
           echo "[LOG] WHAT: TRANSPORT_MOUNT_OK | WHEN: $(date +%s%N)"
 
-      - name: Write AetherCore LOB Daemon (readdir/getattr consistent)
+      - name: Write AetherCore v35 (GroupCommit log segments)
         run: |
           cat > /tmp/aethercore.py <<'PYEOF'
           import os,stat,errno,hashlib,zlib,json,threading,time,signal,traceback
           from collections import OrderedDict
-          from concurrent.futures import ThreadPoolExecutor
           from fuse import FUSE, FuseOSError, Operations
           ROOT="/mnt/drime/lob"; MNT="/mnt/aether"
           VSIZE=int(os.environ["VSIZE"])*1024**3
-          HAS_ISO=os.environ.get("HAS_ISO","false")=="true"
           SLOT=256*1024
-          LRU_MAX=256*1024*1024//SLOT
-          WIN=5*1024*1024
-          ISO_LRU_MAX=256*1024*1024//WIN
-          lock=threading.Lock()
-          index={}; seq=[0]; buf={}; lru=OrderedDict()
-          pool=ThreadPoolExecutor(8)
-          ISO_PATH="/mnt/drime/iso/ubuntu.iso"
-          iso_fd=[None]; ISO_SIZE=[0]; iso_lru=OrderedDict(); iso_lock=threading.Lock()
-          def h(b): return hashlib.sha256(b).hexdigest()[:32]
+          SEGLRU_MAX=64
+          lock=threading.Lock(); commit_req=threading.Event(); commit_done=threading.Event()
+          index={}; buf={}; bufgen=[0]; segseq=[0]; idxseq=[0]; commits_since_idx=[0]
+          seglru=OrderedDict()
           def load_head():
               try: names=sorted(os.listdir(ROOT+"/idx"))
               except FileNotFoundError: names=[]
               if not names: return
-              seq[0]=int(names[-1])
+              idxseq[0]=int(names[-1])
               with open(ROOT+"/idx/"+names[-1],"rb") as f: raw=f.read()
-              index.update(json.loads(zlib.decompress(raw)))
-              print(f"[LOG] WHAT: HEAD_LOADED | SEQ: {seq[0]} | SLOTS: {len(index)} | WHEN: {time.time_ns()}",flush=True)
+              d=json.loads(zlib.decompress(raw))
+              index.update(d["index"]); segseq[0]=d.get("segseq",0)
+              print(f"[LOG] WHAT: HEAD_LOADED | IDX: {idxseq[0]} | SEG: {segseq[0]} | SLOTS: {len(index)} | WHEN: {time.time_ns()}",flush=True)
+          def seg_payload(seq):
+              with lock:
+                  if seq in seglru: seglru.move_to_end(seq); return seglru[seq]
+              with open(f"{ROOT}/log/{seq:010d}","rb") as f: raw=f.read()
+              d=zlib.decompress(raw)
+              with lock:
+                  seglru[seq]=d; seglru.move_to_end(seq)
+                  while len(seglru)>SEGLRU_MAX: seglru.popitem(last=False)
+              return d
+          def commit():
+              with lock:
+                  slots=list(buf.keys())
+                  if not slots: return False
+                  parts=[]; table={}
+                  off=0
+                  for s in slots:
+                      c=zlib.compress(bytes(buf[s]),1)
+                      table[s]=[off,len(c)]; parts.append(c); off+=len(c)
+                  payload=zlib.compress(json.dumps(table).encode()+b"|"+b"".join(parts),1)
+                  segseq[0]+=1; seq=segseq[0]
+                  for s in slots: index[str(s)]=f"{seq}:{table[s][0]}:{table[s][1]}"
+                  buf.clear()
+              p=f"{ROOT}/log/{seq:010d}"
+              fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o644); os.write(fd,payload); os.close(fd)
+              with lock: commits_since_idx[0]+=1
+              if commits_since_idx[0]>=20:
+                  commits_since_idx[0]=0
+                  checkpoint()
+              return True
           def checkpoint():
               with lock:
-                  seq[0]+=1; s=seq[0]; snap=dict(index)
+                  idxseq[0]+=1; s=idxseq[0]
+                  snap={"index":dict(index),"segseq":segseq[0]}
               raw=zlib.compress(json.dumps(snap).encode(),6)
               p=f"{ROOT}/idx/{s:010d}"
               fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o644); os.write(fd,raw); os.close(fd)
-          def flush_slot(slot):
-              with lock:
-                  data=buf.pop(slot,None)
-              if data is None: return
-              if len(data)<SLOT: data=data+b"\x00"*(SLOT-len(data))
-              c=zlib.compress(data,1); name=h(c)
-              if not os.path.exists(ROOT+"/ext/"+name):
-                  fd=os.open(ROOT+"/ext/"+name,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o644)
-                  os.write(fd,c); os.close(fd)
-              with lock: index[str(slot)]=name
-          def flush_all():
-              with lock: slots=list(buf.keys())
-              futs=[pool.submit(flush_slot,s) for s in slots]
-              for f in futs: f.result()
+          def committer():
+              while True:
+                  commit_req.wait(0.2)
+                  commit_req.clear()
+                  try:
+                      if commit(): commit_done.set()
+                      else: commit_done.set()
+                  except Exception:
+                      traceback.print_exc(); commit_done.set()
           def drain():
-              flush_all(); checkpoint()
+              with lock: need=len(buf)>0
+              if not need: return
+              commit_done.clear(); commit_req.set()
+              commit_done.wait(60)
           def read_slot(slot):
               with lock:
                   if slot in buf: return bytes(buf[slot])
-                  name=index.get(str(slot))
-                  if name is None: return b"\x00"*SLOT
-                  if slot in lru: lru.move_to_end(slot); return lru[slot]
-              with open(ROOT+"/ext/"+name,"rb") as f: c=f.read()
-              if h(c)!=name:
-                  os.remove(ROOT+"/ext/"+name)
-                  with open(ROOT+"/ext/"+name,"rb") as f: c=f.read()
-                  if h(c)!=name: raise FuseOSError(errno.EIO)
-              d=zlib.decompress(c)
-              with lock:
-                  lru[slot]=d; lru.move_to_end(slot)
-                  while len(lru)>LRU_MAX: lru.popitem(last=False)
-              return d
+                  ptr=index.get(str(slot))
+                  if ptr is None: return b"\x00"*SLOT
+              seq,off,ln=map(int,ptr.split(":"))
+              pay=seg_payload(seq)
+              c=pay[off:off+ln]
+              return zlib.decompress(c)
           def write_at(off,data):
               pos=0
               while pos<len(data):
@@ -209,85 +218,37 @@ jobs:
                   slot=off//SLOT; s=off-slot*SLOT; n=min(SLOT-s,length-pos)
                   out+=read_slot(slot)[s:s+n]; off+=n; pos+=n
               return bytes(out)
-          def iso_win(w):
-              with iso_lock:
-                  if w in iso_lru: iso_lru.move_to_end(w); return iso_lru[w]
-                  if iso_fd[0] is None:
-                      iso_fd[0]=os.open(ISO_PATH,os.O_RDONLY)
-                      ISO_SIZE[0]=os.fstat(iso_fd[0]).st_size
-                  fd=iso_fd[0]
-              if w*WIN>=ISO_SIZE[0]: return b""
-              chunks=[]; got=0
-              while got<WIN and w*WIN+got<ISO_SIZE[0]:
-                  c=os.pread(fd, min(WIN-got, ISO_SIZE[0]-w*WIN-got), w*WIN+got)
-                  if not c: break
-                  chunks.append(c); got+=len(c)
-              d=b"".join(chunks)
-              with iso_lock:
-                  iso_lru[w]=d; iso_lru.move_to_end(w)
-                  while len(iso_lru)>ISO_LRU_MAX: iso_lru.popitem(last=False)
-              for pw in (w+1,w+2):
-                  if pw*WIN<ISO_SIZE[0]:
-                      with iso_lock: pre=pw in iso_lru
-                      if not pre: pool.submit(iso_win,pw)
-              return d
-          def iso_read(off,size):
-              out=bytearray(); pos=0
-              while pos<size:
-                  w=off//WIN; s=off-w*WIN
-                  win=iso_win(w)
-                  chunk=win[s:s+size-pos]
-                  if not chunk: break
-                  out+=chunk; off+=len(chunk); pos+=len(chunk)
-              return bytes(out)
           class AetherFS(Operations):
               def getattr(self,path,fh=None):
                   if path=="/": return dict(st_mode=(stat.S_IFDIR|0o755),st_nlink=2)
                   if path=="/disk.img": return dict(st_mode=(stat.S_IFREG|0o600),st_nlink=1,st_size=VSIZE,st_blksize=4096,st_blocks=VSIZE//512)
-                  if path=="/iso.img" and HAS_ISO:
-                      if ISO_SIZE[0]==0:
-                          try: ISO_SIZE[0]=os.path.getsize(ISO_PATH)
-                          except FileNotFoundError: raise FuseOSError(errno.ENOENT)
-                      return dict(st_mode=(stat.S_IFREG|0o444),st_nlink=1,st_size=ISO_SIZE[0],st_blksize=4096)
                   raise FuseOSError(errno.ENOENT)
               def readdir(self,path,fh):
                   yield "."; yield ".."; yield "disk.img"
-                  if HAS_ISO: yield "iso.img"
               def open(self,path,flags):
                   if path=="/disk.img": return 0
-                  if path=="/iso.img" and HAS_ISO: return 1
                   raise FuseOSError(errno.ENOENT)
               def read(self,path,size,offset,fh):
-                  if fh==1: return iso_read(offset,size)
                   if offset>=VSIZE: return b""
                   return read_at(offset,min(size,VSIZE-offset))
               def write(self,path,data,offset,fh):
                   write_at(offset,bytes(data)); return len(data)
               def flush(self,path,fh): return 0
               def fsync(self,path,datasync,fh):
-                  if fh==0: drain()
-                  return 0
+                  drain(); return 0
               def release(self,path,fh):
-                  if fh==0: drain()
-                  return 0
+                  drain(); checkpoint(); return 0
               def statfs(self,path):
                   return dict(f_bsize=4096,f_frsize=4096,f_blocks=VSIZE//4096,f_bfree=0,f_bavail=0)
               def truncate(self,path,length,fh=None): return 0
-          def bg_checkpoint():
-              while True:
-                  time.sleep(10)
-                  try:
-                      with lock: need=len(buf)>0
-                      if need: drain()
-                  except Exception: traceback.print_exc()
           def on_term(sig,frm):
-              threading.Thread(target=lambda:(drain(),os._exit(0))).start()
+              threading.Thread(target=lambda:(drain(),checkpoint(),os._exit(0))).start()
           signal.signal(signal.SIGTERM,on_term); signal.signal(signal.SIGINT,on_term)
-          os.makedirs(ROOT+"/ext",exist_ok=True); os.makedirs(ROOT+"/idx",exist_ok=True)
+          os.makedirs(ROOT+"/log",exist_ok=True); os.makedirs(ROOT+"/idx",exist_ok=True)
           os.makedirs(MNT,exist_ok=True)
           load_head()
-          threading.Thread(target=bg_checkpoint,daemon=True).start()
-          print(f"[LOG] WHAT: AETHERCORE_READY | MNT: {MNT} | VSIZE: {VSIZE} | HAS_ISO: {HAS_ISO} | WHEN: {time.time_ns()}",flush=True)
+          threading.Thread(target=committer,daemon=True).start()
+          print(f"[LOG] WHAT: AETHERCORE_READY | MNT: {MNT} | VSIZE: {VSIZE} | GROUPCOMMIT: ON | WHEN: {time.time_ns()}",flush=True)
           FUSE(AetherFS(),MNT,foreground=True,direct_io=True,allow_other=True,nothreads=False)
           PYEOF
           python3 -m py_compile /tmp/aethercore.py
@@ -296,7 +257,7 @@ jobs:
       - name: Launch AetherCore + Assert
         run: |
           set -e
-          sudo env VSIZE=$VSIZE HAS_ISO=$HAS_ISO nohup python3 /tmp/aethercore.py > /tmp/aethercore.log 2>&1 &
+          sudo env VSIZE=$VSIZE nohup python3 /tmp/aethercore.py > /tmp/aethercore.log 2>&1 &
           sleep 8
           cat /tmp/aethercore.log
           grep -q AETHERCORE_READY /tmp/aethercore.log
@@ -308,19 +269,19 @@ jobs:
         run: |
           set -e
           qemu-img info /mnt/aether/disk.img
-          echo "[LOG] WHAT: DISK_PROBEVERIFIED | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DISK_PROBE_VERIFIED | WHEN: $(date +%s%N)"
 
-      - name: Boot VM (LOB disk, VNC 5900)
+      - name: Boot VM (LOB disk + mirror media, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 8192 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
           ARGS="$ARGS -drive file=/mnt/aether/disk.img,if=virtio,format=raw,cache=none"
           if [ "$MODE" = "FIRST" ]; then ARGS="$ARGS -boot order=dc -cdrom $CDROM"; else ARGS="$ARGS -boot order=c"; fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | MEDIA: $MEDIASRC | DISK: AetherCore LOB | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | MEDIA: $MEDIASRC | DISK: LOB-GroupCommit | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
           ( while true; do sleep 300; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
             free -h | head -2 || true; \
-            echo "[LOG] WHAT: EXTENTS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/ext/" 2>/dev/null | wc -l) | IDX: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/idx/" 2>/dev/null | tail -1) | WHEN: $(date +%s%N)"; \
+            echo "[LOG] WHAT: LOG_SEGS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/log/" 2>/dev/null | wc -l) | IDX: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/idx/" 2>/dev/null | tail -1) | WHEN: $(date +%s%N)"; \
           done ) &
           HB=$!
           sudo qemu-system-x86_64 $ARGS &
@@ -340,7 +301,7 @@ jobs:
           sudo pkill -TERM -f aethercore.py || true
           sleep 15
           tail -20 /tmp/aethercore.log || true
-          echo "[LOG] WHAT: FINAL_EXTENTS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/ext/" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: FINAL_SEGS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/log/" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
           sudo umount /mnt/aether || sudo fusermount3 -u /mnt/aether || true
           sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
           echo "[LOG] WHAT: DRAIN_DONE | WHEN: $(date +%s%N)"
