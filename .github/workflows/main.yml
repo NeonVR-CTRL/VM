@@ -1,4 +1,4 @@
-name: AetherGrid AIO (AetherCore v36 Native)
+name: AetherGrid AIO (Pure v37)
 
 on:
   workflow_dispatch:
@@ -21,18 +21,16 @@ jobs:
       DRIME3: ${{ secrets.DRIME3 }}
 
     steps:
-      - name: Install Minimal Stack
+      - name: Install Minimal Stack (NO rclone)
         run: |
           set -e
           sudo apt-get update -y
-          sudo apt-get remove -y rclone || true
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 qemu-utils qemu-system-common qemu-block-extra fuse3 libfuse2 wget curl ca-certificates python3 python3-pip
-          curl https://rclone.org/install.sh | sudo bash
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
           sudo pip3 install --break-system-packages fusepy requests
           sudo python3 -c "import fuse,requests; print('deps OK')"
-          echo "[LOG] WHAT: INSTALL_DONE | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: INSTALL_DONE | NO_RCLONE | WHEN: $(date +%s%N)"
 
       - name: NetBird Mesh Up
         run: |
@@ -41,91 +39,32 @@ jobs:
           sleep 15
           echo "[LOG] WHAT: NETBIRD_UP | WHEN: $(date +%s%N)"
 
-      - name: Build rclone Config (control plane only)
+      - name: Write Pure AetherGrid (A to Z, zero 3rd-party)
         run: |
-          set -e
-          CONF=/tmp/rclone.conf; : > $CONF
-          printf '[drime0]\ntype = drime\naccess_token = %s\n' "$DRIME" >> $CONF
-          N=1; i=1
-          for V in DRIME1 DRIME2 DRIME3; do
-            VAL="${!V}"
-            if [ -n "$VAL" ]; then
-              printf '[drime%d]\ntype = drime\naccess_token = %s\n' "$i" "$VAL" >> $CONF
-              N=$((N+1)); i=$((i+1))
-            fi
-          done
-          if [ "$N" -gt 1 ]; then
-            UP=""
-            for k in $(seq 0 $((N-1))); do UP="$UP drime$k:"; done
-            printf '[union]\ntype = union\nupstreams =%s\ncreate_policy = epmfs\naction_policy = epall\nsearch_policy = ff\n' "$UP" >> $CONF
-            REMOTE=union
-          else
-            REMOTE=drime0
-          fi
-          chmod 600 $CONF
-          echo "REMOTE=$REMOTE" >> $GITHUB_ENV
-          echo "ACCOUNTS=$N"    >> $GITHUB_ENV
-          echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | WHEN: $(date +%s%N)"
-
-      - name: Self-Heal + Mode + Size
-        run: |
-          set -e
-          rclone mkdir --config /tmp/rclone.conf "${REMOTE}:lob" || true
-          rclone mkdir --config /tmp/rclone.conf "${REMOTE}:lob/idx" || true
-          rclone mkdir --config /tmp/rclone.conf "${REMOTE}:lob/seg" || true
-          if [ "${{ github.event.inputs.force_reinstall }}" = "true" ]; then
-            rclone purge --config /tmp/rclone.conf "${REMOTE}:lob" || true
-            rclone mkdir --config /tmp/rclone.conf "${REMOTE}:lob/idx" || true
-            rclone mkdir --config /tmp/rclone.conf "${REMOTE}:lob/seg" || true
-            echo "[LOG] WHAT: SELF_HEAL | purged lob/ | WHEN: $(date +%s%N)"
-          fi
-          IDX=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/idx/" 2>/dev/null | head -1 || true)
-          if [ -n "$IDX" ]; then MODE=BOOT; else MODE=FIRST; fi
-          if [ "$ACCOUNTS" -eq 1 ]; then VSIZE=18; else VSIZE=$((18*ACCOUNTS-4)); fi
-          echo "MODE=$MODE"   >> $GITHUB_ENV
-          echo "VSIZE=$VSIZE" >> $GITHUB_ENV
-          echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
-
-      - name: Resolve Media (mirror)
-        if: env.MODE == 'FIRST'
-        run: |
-          set -e
-          ISO_URL=""
-          for u in "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso" \
-                   "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; do
-            if curl -sfI "$u" | head -1 | grep -qE "HTTP/[^ ]+ (200|302)"; then ISO_URL=$u; break; fi
-          done
-          [ -n "$ISO_URL" ] || { echo "[LOG] WHAT: MEDIA_DEAD | WHEN: $(date +%s%N)"; exit 1; }
-          echo "CDROM=$ISO_URL" >> $GITHUB_ENV
-          rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
-          echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: mirror | WHEN: $(date +%s%N)"
-
-      - name: Write AetherCore v36 (Native Drime client)
-        run: |
-          cat > /tmp/aethercore.py <<'PYEOF'
-          import os,stat,errno,zlib,json,threading,time,signal,traceback
+          cat > /tmp/pure_aethergrid.py <<'PYEOF'
+          import os,sys,stat,errno,zlib,json,threading,time,signal,traceback,subprocess
           from collections import OrderedDict
           from concurrent.futures import ThreadPoolExecutor
           import requests
           from fuse import FUSE, FuseOSError, Operations
-          TOKEN=os.environ["DRIME_TOKEN"]; VSIZE=int(os.environ["VSIZE"])*1024**3
+          
+          TOKENS=[os.environ["DRIME"]]+[os.environ[k] for k in ["DRIME1","DRIME2","DRIME3"] if os.environ.get(k)]
+          TOKEN=TOKENS[0]
+          VSIZE=int(os.environ.get("VSIZE","18"))*1024**3
+          FORCE=os.environ.get("FORCE","false")=="true"
           MNT="/mnt/aether"; API="https://app.drime.cloud/api/v1"; BASE="https://app.drime.cloud/"
           SLOT=256*1024; PART=5*1024*1024; SEGLRU_MAX=64; COMMIT_WINDOW=2.0
           S=requests.Session(); S.headers.update({"Authorization":"Bearer "+TOKEN,"Accept":"application/json"})
           pool=ThreadPoolExecutor(8)
           lock=threading.Lock(); commit_req=threading.Event(); commit_done=threading.Event()
           index={}; buf={}; segseq=[0]; idxseq=[0]; seglru=OrderedDict(); segurl={}
-          RAWLOGGED=set()
+          
           def log(w,v): print(f"[LOG] WHAT: {w} | {v} | WHEN: {time.time_ns()}",flush=True)
-          def raw(tag,j):
-              if tag not in RAWLOGGED:
-                  RAWLOGGED.add(tag); log("RAW_"+tag, json.dumps(j)[:900])
           def walk(o):
               st=[o]
               while st:
                   c=st.pop()
-                  if isinstance(c,dict):
-                      yield c; st.extend(c.values())
+                  if isinstance(c,dict): yield c; st.extend(c.values())
                   elif isinstance(c,list): st.extend(c)
           def find_items(o):
               st=[o]
@@ -149,7 +88,7 @@ jobs:
               out=[]; page=1
               while True:
                   r=S.get(API+"/drive/file-entries",params={"folderId":fid,"perPage":200,"page":page},timeout=60)
-                  r.raise_for_status(); j=r.json(); raw("LIST",j)
+                  r.raise_for_status(); j=r.json()
                   items=find_items(j); out+=items
                   if len(items)<200: break
                   page+=1
@@ -157,23 +96,26 @@ jobs:
           FOLDERS={}
           def folder(path):
               if path in FOLDERS: return FOLDERS[path]
+              parts=path.split("/")
               cur=""
-              for leaf in path.split("/"):
-                  key=path if leaf==path.split("/")[-1] else "/".join(path.split("/")[:path.split("/").index(leaf)+1])
-                  items=[i for i in list_dir(cur) if i.get("name")==leaf]
+              for i,leaf in enumerate(parts):
+                  key="/".join(parts[:i+1])
+                  if key in FOLDERS: cur=FOLDERS[key]; continue
+                  items=[it for it in list_dir(cur) if it.get("name")==leaf]
                   if items: cur=str(items[0]["id"])
                   else:
-                      r=S.post(API+"/folders",json={"Name":leaf,"ParentID":cur},timeout=60)
-                      r.raise_for_status(); cur=str(dig(r.json(),"id"))
+                      r=S.post(API+"/folders",json={"name":leaf,"parent_id":int(cur) if cur else 0,"workspace_id":0},timeout=60)
+                      r.raise_for_status(); j=r.json()
+                      cur=str(dig(j,"id"))
                   FOLDERS[key]=cur
               FOLDERS[path]=cur; return cur
           def mp_create(fname,parent):
-              r=S.post(API+"/s3/multipart/create",json={"Filename":fname,"Mime":"application/octet-stream","Size":0,"Extension":"bin","ParentID":parent,"RelativePath":fname},timeout=60)
-              r.raise_for_status(); j=r.json(); raw("MPCREATE",j)
+              r=S.post(API+"/s3/multipart/create",json={"Filename":fname,"Mime":"application/octet-stream","Size":0,"Extension":"bin","ParentID":int(parent),"RelativePath":fname,"WorkspaceID":0},timeout=60)
+              r.raise_for_status(); j=r.json()
               return str(dig(j,"uploadid","upload_id")), str(dig(j,"key"))
           def mp_sign(up,key,nums):
               r=S.post(API+"/s3/multipart/batch-sign-part-urls",json={"UploadID":up,"Key":key,"PartNumbers":nums},timeout=60)
-              r.raise_for_status(); j=r.json(); raw("MPSIGN",j)
+              r.raise_for_status(); j=r.json()
               m={}
               for d in walk(j):
                   pn=None; url=None
@@ -187,8 +129,8 @@ jobs:
               r.raise_for_status(); return r.headers.get("ETag","")
           def mp_complete(up,key,parts):
               r=S.post(API+"/s3/multipart/complete",json={"UploadID":up,"Key":key,"Parts":parts},timeout=120)
-              r.raise_for_status(); j=r.json(); raw("MPCOMPLETE",j)
-              return j
+              r.raise_for_status(); j=r.json()
+              return digurl(j)
           def upload_blob(name,data,parent):
               up,key=mp_create(name,parent)
               nparts=max(1,(len(data)+PART-1)//PART)
@@ -201,9 +143,14 @@ jobs:
               futs=[pool.submit(do,pn) for pn in range(1,nparts+1)]
               for f in futs: parts.append(f.result())
               parts.sort(key=lambda p:p["PartNumber"])
-              j=mp_complete(up,key,parts)
-              u=digurl(j)
-              return u
+              return mp_complete(up,key,parts)
+          def delete_file(fid):
+              r=S.post(API+"/file-entries/delete",json={"EntryIDs":[str(fid)],"DeleteForever":True},timeout=60)
+              r.raise_for_status()
+          def purge(path):
+              fid=folder(path)
+              for it in list_dir(fid):
+                  delete_file(it["id"])
           def load_head():
               fid=folder("lob/idx")
               names=sorted(i["name"] for i in list_dir(fid))
@@ -313,22 +260,64 @@ jobs:
           def on_term(sig,frm):
               threading.Thread(target=lambda:(drain(),os._exit(0))).start()
           signal.signal(signal.SIGTERM,on_term); signal.signal(signal.SIGINT,on_term)
+          
+          # Control plane
+          folder("lob/idx"); folder("lob/seg")
+          if FORCE:
+              purge("lob/idx"); purge("lob/seg")
+              log("SELF_HEAL", "purged lob")
           os.makedirs(MNT,exist_ok=True)
           load_head()
           threading.Thread(target=committer,daemon=True).start()
-          log("AETHERCORE_READY", f"MNT:{MNT} VSIZE:{VSIZE} NATIVE:ON")
+          log("AETHERCORE_READY", f"MNT:{MNT} VSIZE:{VSIZE} PURE:ON")
           FUSE(AetherFS(),MNT,foreground=True,direct_io=True,allow_other=True,nothreads=False)
           PYEOF
-          python3 -m py_compile /tmp/aethercore.py
-          echo "[LOG] WHAT: AETHERCORE_COMPILED | WHEN: $(date +%s%N)"
+          python3 -m py_compile /tmp/pure_aethergrid.py
+          echo "[LOG] WHAT: PURE_COMPILED | WHEN: $(date +%s%N)"
 
-      - name: Launch AetherCore + Assert
+      - name: Detect Mode
         run: |
           set -e
-          sudo env VSIZE=$VSIZE DRIME_TOKEN=$DRIME nohup python3 /tmp/aethercore.py > /tmp/aethercore.log 2>&1 &
+          sudo env DRIME=$DRIME DRIME1=$DRIME1 DRIME2=$DRIME2 DRIME3=$DRIME3 FORCE=${{ github.event.inputs.force_reinstall }} python3 -c "
+          import requests,os
+          T=os.environ['DRIME']
+          S=requests.Session(); S.headers.update({'Authorization':'Bearer '+T,'Accept':'application/json'})
+          API='https://app.drime.cloud/api/v1'
+          r=S.get(API+'/drive/file-entries',params={'perPage':200},timeout=60)
+          items=[i for i in r.json().get('data',[]) if i.get('name')=='lob']
+          if not items: print('MODE=FIRST')
+          else:
+              lob=str(items[0]['id'])
+              r2=S.get(API+'/drive/file-entries',params={'folderId':lob,'perPage':200},timeout=60)
+              idx=[i for i in r2.json().get('data',[]) if i.get('name')=='idx']
+              if idx:
+                  r3=S.get(API+'/drive/file-entries',params={'folderId':str(idx[0]['id']),'perPage':200},timeout=60)
+                  if r3.json().get('data'): print('MODE=BOOT')
+                  else: print('MODE=FIRST')
+              else: print('MODE=FIRST')
+          " >> $GITHUB_ENV
+          echo "VSIZE=18" >> $GITHUB_ENV
+
+      - name: Resolve Media (mirror)
+        if: env.MODE == 'FIRST'
+        run: |
+          set -e
+          ISO_URL=""
+          for u in "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso" \
+                   "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; do
+            if curl -sfI "$u" | head -1 | grep -qE "HTTP/[^ ]+ (200|302)"; then ISO_URL=$u; break; fi
+          done
+          [ -n "$ISO_URL" ] || { echo "[LOG] WHAT: MEDIA_DEAD | WHEN: $(date +%s%N)"; exit 1; }
+          echo "CDROM=$ISO_URL" >> $GITHUB_ENV
+          echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: mirror | WHEN: $(date +%s%N)"
+
+      - name: Launch Pure AetherGrid + Assert
+        run: |
+          set -e
+          sudo env VSIZE=$VSIZE DRIME=$DRIME DRIME1=$DRIME1 DRIME2=$DRIME2 DRIME3=$DRIME3 FORCE=${{ github.event.inputs.force_reinstall }} nohup python3 /tmp/pure_aethergrid.py > /tmp/aethergrid.log 2>&1 &
           sleep 10
-          cat /tmp/aethercore.log
-          grep -q AETHERCORE_READY /tmp/aethercore.log
+          cat /tmp/aethergrid.log
+          grep -q AETHERCORE_READY /tmp/aethergrid.log
           mountpoint -q /mnt/aether || { echo "[LOG] WHAT: AETHER_MOUNT_DEAD | WHEN: $(date +%s%N)"; exit 1; }
           ls -l /mnt/aether/disk.img
           echo "[LOG] WHAT: AETHERCORE_ALIVE | WHEN: $(date +%s%N)"
@@ -345,11 +334,11 @@ jobs:
           ARGS="-m 8192 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
           ARGS="$ARGS -drive file=/mnt/aether/disk.img,if=virtio,format=raw,cache=none"
           if [ "$MODE" = "FIRST" ]; then ARGS="$ARGS -boot order=dc -cdrom $CDROM"; else ARGS="$ARGS -boot order=c"; fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | DISK: LOB-Native | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | DISK: Pure-LOB | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
           ( while true; do sleep 300; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
             free -h | head -2 || true; \
-            echo "[LOG] WHAT: SEGS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/seg/" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"; \
+            tail -5 /tmp/aethergrid.log || true; \
           done ) &
           HB=$!
           sudo qemu-system-x86_64 $ARGS &
@@ -360,15 +349,13 @@ jobs:
           echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
           exit $EXIT
 
-      - name: Drain + Unmount (ALWAYS)
+      - name: Drain (ALWAYS)
         if: always()
         run: |
           echo "[LOG] WHAT: DRAIN_START | WHEN: $(date +%s%N)"
           sudo pkill -TERM -f qemu-system-x86_64 || true
           sleep 3
-          sudo pkill -TERM -f aethercore.py || true
+          sudo pkill -TERM -f pure_aethergrid.py || true
           sleep 15
-          tail -30 /tmp/aethercore.log || true
-          echo "[LOG] WHAT: FINAL_SEGS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/seg/" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
-          sudo umount /mnt/aether || sudo fusermount3 -u /mnt/aether || true
+          tail -30 /tmp/aethergrid.log || true
           echo "[LOG] WHAT: DRAIN_DONE | WHEN: $(date +%s%N)"
