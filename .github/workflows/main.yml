@@ -1,4 +1,4 @@
-name: AetherGrid AIO (AetherCore LOB v31)
+name: AetherGrid AIO (AetherCore v32)
 
 on:
   workflow_dispatch:
@@ -100,7 +100,7 @@ jobs:
           mountpoint -q /mnt/drime
           echo "[LOG] WHAT: TRANSPORT_MOUNT_OK | WHEN: $(date +%s%N)"
 
-      - name: Write AetherCore LOB Daemon
+      - name: Write AetherCore LOB Daemon (pread-safe ISO proxy)
         run: |
           cat > /tmp/aethercore.py <<'PYEOF'
           import os,stat,errno,hashlib,zlib,json,threading,time,signal,traceback
@@ -109,13 +109,14 @@ jobs:
           from fuse import FUSE, FuseOSError, Operations
           ROOT="/mnt/drime/lob"; MNT="/mnt/aether"
           VSIZE=int(os.environ["VSIZE"])*1024**3
-          SLOT=256*1024; NSLOT=VSIZE//SLOT
+          SLOT=256*1024
           LRU_MAX=256*1024*1024//SLOT; ISO_LRU_MAX=256*1024*1024//(4*1024*1024)
           WIN=4*1024*1024
           lock=threading.Lock(); cond=threading.Condition(lock)
-          index={}; seq=[0]; buf={}; buftouch={}; lru=OrderedDict()
+          index={}; seq=[0]; buf={}; lru=OrderedDict()
           pool=ThreadPoolExecutor(8)
-          ISO_PATH="/mnt/drime/iso/ubuntu.iso"; iso_fd=[None]; iso_lru=OrderedDict(); iso_lock=threading.Lock()
+          ISO_PATH="/mnt/drime/iso/ubuntu.iso"
+          iso_fd=[None]; ISO_SIZE=[0]; iso_lru=OrderedDict(); iso_lock=threading.Lock()
           def h(b): return hashlib.sha256(b).hexdigest()[:32]
           def load_head():
               try: names=sorted(os.listdir(ROOT+"/idx"))
@@ -132,7 +133,8 @@ jobs:
               p=f"{ROOT}/idx/{s:010d}"
               fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o644); os.write(fd,raw); os.close(fd)
           def flush_slot(slot):
-              data=bytes(buf.pop(slot)) if slot in buf else None
+              with lock:
+                  data=buf.pop(slot,None)
               if data is None: return
               if len(data)<SLOT: data=data+b"\x00"*(SLOT-len(data))
               c=zlib.compress(data,1); name=h(c)
@@ -170,7 +172,7 @@ jobs:
                       b=buf.get(slot)
                       if b is None:
                           b=bytearray(read_slot(slot)); buf[slot]=b
-                      b[s:s+n]=data[pos:pos+n]; buftouch[slot]=time.time()
+                      b[s:s+n]=data[pos:pos+n]
                   off+=n; pos+=n
           def read_at(off,length):
               out=bytearray(); pos=0
@@ -181,13 +183,14 @@ jobs:
           def iso_win(w):
               with iso_lock:
                   if w in iso_lru: iso_lru.move_to_end(w); return iso_lru[w]
-              fd=iso_fd[0]
-              if fd is None:
-                  fd=iso_fd[0]=os.open(ISO_PATH,os.O_RDONLY)
-              os.lseek(fd,w*WIN,os.SEEK_SET)
+                  if iso_fd[0] is None:
+                      iso_fd[0]=os.open(ISO_PATH,os.O_RDONLY)
+                      ISO_SIZE[0]=os.fstat(iso_fd[0]).st_size
+                  fd=iso_fd[0]
+              if w*WIN>=ISO_SIZE[0]: return b""
               chunks=[]; got=0
               while got<WIN:
-                  c=os.read(fd,WIN-got)
+                  c=os.pread(fd, WIN-got, w*WIN+got)
                   if not c: break
                   chunks.append(c); got+=len(c)
               d=b"".join(chunks)
@@ -195,8 +198,9 @@ jobs:
                   iso_lru[w]=d; iso_lru.move_to_end(w)
                   while len(iso_lru)>ISO_LRU_MAX: iso_lru.popitem(last=False)
               for pw in (w+1,w+2,w+3):
-                  with iso_lock: pre=pw in iso_lru
-                  if not pre: pool.submit(iso_win,pw)
+                  if pw*WIN<ISO_SIZE[0]:
+                      with iso_lock: pre=pw in iso_lru
+                      if not pre: pool.submit(iso_win,pw)
               return d
           def iso_read(off,size):
               out=bytearray(); pos=0
@@ -208,8 +212,9 @@ jobs:
               def getattr(self,path,fh=None):
                   if path=="/": return dict(st_mode=(stat.S_IFDIR|0o755),st_nlink=2)
                   if path=="/disk.img": return dict(st_mode=(stat.S_IFREG|0o600),st_nlink=1,st_size=VSIZE,st_blksize=4096,st_blocks=VSIZE//512)
-                  if path=="/iso.img" and iso_fd[0] is not None or (path=="/iso.img" and os.path.exists(ISO_PATH)):
-                      return dict(st_mode=(stat.S_IFREG|0o444),st_nlink=1,st_size=os.path.getsize(ISO_PATH),st_blksize=4096)
+                  if path=="/iso.img":
+                      if ISO_SIZE[0]==0 and os.path.exists(ISO_PATH): ISO_SIZE[0]=os.path.getsize(ISO_PATH)
+                      if ISO_SIZE[0]: return dict(st_mode=(stat.S_IFREG|0o444),st_nlink=1,st_size=ISO_SIZE[0],st_blksize=4096)
                   raise FuseOSError(errno.ENOENT)
               def readdir(self,path,fh):
                   for p in (".","..","disk.img","iso.img"): yield p
@@ -270,7 +275,7 @@ jobs:
           qemu-img info /mnt/aether/disk.img
           echo "[LOG] WHAT: DISK_PROBE_VERIFIED | WHEN: $(date +%s%N)"
 
-      - name: Boot VM (LOB disk + ISO proxy, VNC 5900)
+      - name: Boot VM (LOB disk + pread-safe ISO proxy, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 8192 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
@@ -285,7 +290,7 @@ jobs:
           ( while true; do sleep 300; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
             free -h | head -2 || true; \
-            echo "[LOG] WHAT: EXTENTS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/ext/" 2>/dev/null | wc -l) | IDX_SEQ: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/idx/" 2>/dev/null | tail -1) | WHEN: $(date +%s%N)"; \
+            echo "[LOG] WHAT: EXTENTS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/ext/" 2>/dev/null | wc -l) | IDX: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:lob/idx/" 2>/dev/null | tail -1) | WHEN: $(date +%s%N)"; \
           done ) &
           HB=$!
           sudo qemu-system-x86_64 $ARGS &
