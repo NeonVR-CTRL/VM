@@ -1,4 +1,4 @@
-name: AetherGrid AIO (ShardFS ZeroRAM v28)
+name: AetherGrid AIO (AetherClient v30)
 
 on:
   workflow_dispatch:
@@ -25,14 +25,12 @@ jobs:
         run: |
           set -e
           sudo apt-get update -y
-          sudo apt-get remove -y rclone || true
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 qemu-utils qemu-system-common qemu-block-extra fuse3 libfuse2 wget curl ca-certificates python3 python3-pip
-          curl https://rclone.org/install.sh | sudo bash
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
-          sudo pip3 install --break-system-packages fusepy
-          sudo python3 -c "import fuse; print('fusepy OK (root)')"
-          echo "[LOG] WHAT: INSTALL_DONE | WHEN: $(date +%s%N)"
+          sudo pip3 install --break-system-packages fusepy requests
+          sudo python3 -c "import fuse,requests; print('deps OK (root)')"
+          echo "[LOG] WHAT: INSTALL_DONE | RCLONE: NOT_INSTALLED | WHEN: $(date +%s%N)"
 
       - name: NetBird Mesh Up
         run: |
@@ -41,131 +39,137 @@ jobs:
           sleep 15
           echo "[LOG] WHAT: NETBIRD_UP | WHEN: $(date +%s%N)"
 
-      - name: Build Drime Config
-        run: |
-          set -e
-          CONF=/tmp/rclone.conf; : > $CONF
-          printf '[drime0]\ntype = drime\naccess_token = %s\n' "$DRIME" >> $CONF
-          N=1; i=1
-          for V in DRIME1 DRIME2 DRIME3; do
-            VAL="${!V}"
-            if [ -n "$VAL" ]; then
-              printf '[drime%d]\ntype = drime\naccess_token = %s\n' "$i" "$VAL" >> $CONF
-              N=$((N+1)); i=$((i+1))
-            fi
-          done
-          if [ "$N" -gt 1 ]; then
-            UP=""
-            for k in $(seq 0 $((N-1))); do UP="$UP drime$k:"; done
-            printf '[union]\ntype = union\nupstreams =%s\ncreate_policy = epmfs\naction_policy = epall\nsearch_policy = ff\n' "$UP" >> $CONF
-            REMOTE=union
-          else
-            REMOTE=drime0
-          fi
-          chmod 600 $CONF
-          echo "REMOTE=$REMOTE" >> $GITHUB_ENV
-          echo "ACCOUNTS=$N"    >> $GITHUB_ENV
-          echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | WHEN: $(date +%s%N)"
-
-      - name: Parent Folder + Self-Heal + Mode + Size
-        run: |
-          set -e
-          rclone mkdir --config /tmp/rclone.conf "${REMOTE}:vm" || true
-          if [ "${{ github.event.inputs.force_reinstall }}" = "true" ]; then
-            rclone purge --config /tmp/rclone.conf "${REMOTE}:vm" || true
-            rclone mkdir --config /tmp/rclone.conf "${REMOTE}:vm" || true
-            echo "[LOG] WHAT: SELF_HEAL | purged+recreated vm/ | WHEN: $(date +%s%N)"
-          fi
-          EXIST=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | head -1 || true)
-          if [ -n "$EXIST" ]; then MODE=BOOT; else MODE=FIRST; fi
-          if [ "$ACCOUNTS" -eq 1 ]; then VSIZE=18; else VSIZE=$((18*ACCOUNTS-4)); fi
-          echo "MODE=$MODE"   >> $GITHUB_ENV
-          echo "VSIZE=$VSIZE" >> $GITHUB_ENV
-          echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
-
-      - name: Resolve Media (Drime ISO cache-off = ZERO RAM, HTTPS last resort)
-        if: env.MODE == 'FIRST'
-        run: |
-          set -e
-          HAS=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:iso" 2>/dev/null | grep -c '^ubuntu.iso$' || true)
-          if [ "${HAS:-0}" != "0" ]; then
-            sudo mkdir -p /mnt/drime
-            sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
-            sudo rclone mount "${REMOTE}:" /mnt/drime \
-              --config /tmp/rclone.conf \
-              --vfs-cache-mode off \
-              --allow-other --log-level INFO --daemon
-            sleep 8
-            mountpoint -q /mnt/drime
-            [ -f /mnt/drime/iso/ubuntu.iso ]
-            echo "CDROM=/mnt/drime/iso/ubuntu.iso" >> $GITHUB_ENV
-            echo "MEDIASRC=drime" >> $GITHUB_ENV
-            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: Drime iso/ | CACHE: OFF | RAM: 0 | WHEN: $(date +%s%N)"
-          else
-            ISO_URL=""
-            for u in "https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso" \
-                     "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; do
-              if curl -sfI "$u" | head -1 | grep -qE "HTTP/[^ ]+ (200|302)"; then ISO_URL=$u; break; fi
-            done
-            [ -n "$ISO_URL" ] || { echo "[LOG] WHAT: MEDIA_DEAD | WHEN: $(date +%s%N)"; exit 1; }
-            echo "CDROM=$ISO_URL" >> $GITHUB_ENV
-            echo "MEDIASRC=https" >> $GITHUB_ENV
-            echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: $ISO_URL | RAM: 0 | WHEN: $(date +%s%N)"
-          fi
-
-      - name: Write ShardFS Daemon
+      - name: Write AetherClient + ShardFS Daemon
         run: |
           cat > /tmp/shardfs.py <<'PYEOF'
-          import os,stat,errno,subprocess,threading,time,signal,traceback
+          import os,stat,errno,threading,time,signal,traceback,hashlib,re,json
           from collections import OrderedDict
           from concurrent.futures import ThreadPoolExecutor
+          import requests
+          from requests.adapters import HTTPAdapter
           from fuse import FUSE, FuseOSError, Operations
-          CONF="/tmp/rclone.conf"; REMOTE=os.environ["REMOTE"]; VSIZE=int(os.environ["VSIZE"])*1024**3
-          SHARD=4*1024*1024; DIRTY_MAX=256*1024*1024; MNT="/mnt/sharddisk"; CACHE_MAX=64
-          RC=["rclone","--config",CONF]
+          BASE="https://app.drime.cloud/"; ROOT=BASE+"api/v1"
+          SHARD=4*1024*1024; DIRTY_MAX=256*1024*1024; MNT="/mnt/sharddisk"; CACHE_MAX=96; THREADS=16
+          VSIZE=int(os.environ["VSIZE"])*1024**3
+          TOKENS=[t for t in [os.environ.get("DRIME"),os.environ.get("DRIME1"),os.environ.get("DRIME2"),os.environ.get("DRIME3")] if t]
           lock=threading.Lock(); cond=threading.Condition(lock)
           dirty={}; touched={}; uploading={}; fetching=set(); cache=OrderedDict()
-          def name(i): return f"vm/shard_{i:06d}"
+          lasthash={}; ids={}; urls={}; HWM=[-1]
+          def g(d,*ks,**kw):
+              for k in ks:
+                  if isinstance(d,dict) and k in d: return d[k]
+              return kw.get("default")
+          class DrimeAPI:
+              def __init__(self,token):
+                  self.s=requests.Session()
+                  a=HTTPAdapter(pool_connections=32,pool_maxsize=32,max_retries=0)
+                  self.s.mount("https://",a)
+                  self.s.headers.update({"Authorization":"Bearer "+token,"Accept":"application/json"})
+                  self.vmid=None; self.rootid=""
+              def call(self,method,path,**kw):
+                  for att in range(4):
+                      try:
+                          r=self.s.request(method,ROOT+path,timeout=(10,180),**kw)
+                          if r.status_code in (429,500,502,503,504,520,521,522,523,524):
+                              time.sleep(1+att); continue
+                          return r
+                      except requests.exceptions.RequestException:
+                          time.sleep(1+att)
+                  return r
+              def discover(self):
+                  r=self.call("GET","/drive/file-entries",params={"perPage":1000,"page":1})
+                  r.raise_for_status(); items=r.json().get("data",[]) or r.json().get("Data",[]) or []
+                  for it in items:
+                      if g(it,"name")=="vm" and g(it,"type")=="folder": self.vmid=str(g(it,"id"))
+                  if items: self.rootid=str(g(items[0],"parent_id","parentId",default=""))
+                  if self.vmid is None:
+                      body={"name":"vm"}
+                      if self.rootid: body["parentId"]=self.rootid
+                      rc=self.call("POST","/folders",json=body)
+                      if rc.status_code in (200,201):
+                          fo=g(rc.json(),"folder","data",default=rc.json())
+                          self.vmid=str(g(fo,"id"))
+                  print(f"[LOG] WHAT: API_DISCOVERED | VMID: {self.vmid} | ROOTID: {self.rootid} | WHEN: {time.time_ns()}",flush=True)
+              def list_shards(self):
+                  out={}; page=1
+                  while True:
+                      r=self.call("GET","/drive/file-entries",params={"folderId":self.vmid,"perPage":1000,"page":page})
+                      if r.status_code!=200: break
+                      j=r.json(); items=j.get("data",[]) or []
+                      for it in items:
+                          m=re.match(r"shard_(\d+)$",str(g(it,"name","")))
+                          if m: out[int(m.group(1))]=(str(g(it,"id")),g(it,"url"))
+                      cp=g(j,"current_page","currentPage",default=1); lp=g(j,"last_page","lastPage",default=1)
+                      if cp>=lp: break
+                      page=cp+1
+                  return out
+              def upload(self,name,data):
+                  r=self.call("POST","/uploads",files={"file":(name,data,"application/octet-stream")},
+                              data={"parentId":self.vmid,"relativePath":name})
+                  if r.status_code not in (200,201):
+                      print(f"[LOG] WHAT: UPLOAD_FAIL | CODE: {r.status_code} | BODY: {r.text[:300]} | WHEN: {time.time_ns()}",flush=True)
+                      return None
+                  e=g(r.json(),"fileEntry","file_entry","data",default=r.json())
+                  return (str(g(e,"id")),g(e,"url"))
+              def fetch(self,url):
+                  r=self.call("GET",BASE+url.lstrip("/"))
+                  if r.status_code==200: return bytearray(r.content)
+                  return None
+              def delete(self,eid):
+                  self.call("POST","/file-entries/delete",json={"entryIds":[eid],"deleteForever":True})
+          APIS=[DrimeAPI(t) for t in TOKENS]
+          def acct(i): return APIS[i%len(APIS)]
           def put(i,data):
-              p=subprocess.run(RC+["rcat",f"{REMOTE}:{name(i)}"],input=bytes(data),capture_output=True)
-              if p.returncode==0: return True
-              subprocess.run(RC+["deletefile",f"{REMOTE}:{name(i)}"],capture_output=True)
-              p=subprocess.run(RC+["rcat",f"{REMOTE}:{name(i)}"],input=bytes(data),capture_output=True)
-              return p.returncode==0
+              h=hashlib.md5(data).hexdigest()
+              if lasthash.get(i)==h: return True
+              a=acct(i); res=a.upload(f"shard_{i:06d}",bytes(data))
+              if not res: return False
+              with lock:
+                  old=ids.get(i)
+                  ids[i]=res[0]; urls[i]=res[1]; lasthash[i]=h
+              if old: a.delete(old)
+              return True
           def get(i):
-              p=subprocess.run(RC+["cat",f"{REMOTE}:{name(i)}"],capture_output=True)
-              if p.returncode==0 and p.stdout: return bytearray(p.stdout)
-              return bytearray(SHARD)
+              u=None
+              with lock: u=urls.get(i)
+              if u is None: return None
+              return acct(i).fetch(u)
           def uploader():
-              pool=ThreadPoolExecutor(4); futs={}
+              pool=ThreadPoolExecutor(THREADS); futs={}
               while True:
                   with lock:
                       now=time.time()
-                      for i in [i for i in dirty if now-touched[i]>2.0 and i not in futs]:
+                      for i in [i for i in dirty if now-touched[i]>1.0 and i not in futs]:
                           uploading[i]=dirty.pop(i); futs[i]=pool.submit(put,i,uploading[i])
                       for i in [i for i,f in futs.items() if f.done()]:
                           f=futs.pop(i); ok=f.result()
-                          if ok: uploading.pop(i,None)
+                          if ok:
+                              data=uploading.pop(i,None)
+                              if data is not None:
+                                  cache[i]=data; cache.move_to_end(i)
+                                  while len(cache)>CACHE_MAX: cache.popitem(last=False)
                           else: dirty[i]=uploading.pop(i); touched[i]=time.time()
                       cond.notify_all()
-                  time.sleep(0.5)
+                  time.sleep(0.2)
           def drain():
               while True:
                   with lock:
                       if not dirty and not uploading: return
-                  time.sleep(0.3)
+                  time.sleep(0.1)
           def shard_buf(i):
               with lock:
                   if i in dirty: return dirty[i]
                   if i in uploading: return uploading[i]
                   if i in cache:
                       cache.move_to_end(i); return cache[i]
+                  if i>HWM[0]: return bytearray(SHARD)
                   while i in fetching: cond.wait(0.2)
                   fetching.add(i)
               b=get(i)
               with lock:
                   fetching.discard(i)
                   if i in dirty: return dirty[i]
+                  if b is None: b=bytearray(SHARD)
                   cache[i]=b; cache.move_to_end(i)
                   while len(cache)>CACHE_MAX: cache.popitem(last=False)
                   return b
@@ -177,6 +181,7 @@ jobs:
                   with lock:
                       b[s:s+n]=data[pos:pos+n]; touched[i]=time.time()
                       cache.pop(i,None); dirty[i]=b
+                      if i>HWM[0]: HWM[0]=i
                       while len(dirty)*SHARD>DIRTY_MAX: cond.wait(0.2)
                   off+=n; pos+=n
           def read_at(off,length):
@@ -197,11 +202,9 @@ jobs:
                   return 0
               def read(self,path,size,offset,fh):
                   if offset>=VSIZE: return b""
-                  size=min(size,VSIZE-offset)
-                  return read_at(offset,size)
+                  return read_at(offset,min(size,VSIZE-offset))
               def write(self,path,data,offset,fh):
-                  write_at(offset,bytes(data))
-                  return len(data)
+                  write_at(offset,bytes(data)); return len(data)
               def flush(self,path,fh): return 0
               def fsync(self,path,datasync,fh): drain(); return 0
               def release(self,path,fh): drain(); return 0
@@ -211,42 +214,145 @@ jobs:
           def on_term(sig,frm):
               threading.Thread(target=lambda:(drain(),os._exit(0))).start()
           signal.signal(signal.SIGTERM,on_term); signal.signal(signal.SIGINT,on_term)
+          for a in APIS: a.discover()
+          mx=-1
+          for idx,a in enumerate(APIS):
+              for i,(eid,u) in a.list_shards().items():
+                  with lock: ids[i]=eid; urls[i]=u
+                  mx=max(mx,i)
+          HWM[0]=mx
+          print(f"[LOG] WHAT: AETHERCLIENT_READY | ACCOUNTS: {len(APIS)} | HWM: {mx} | WHEN: {time.time_ns()}",flush=True)
           threading.Thread(target=uploader,daemon=True).start()
           os.makedirs(MNT,exist_ok=True)
-          print(f"[LOG] WHAT: SHARDFS_READY | MNT: {MNT} | VSIZE: {VSIZE} | WHEN: {time.time_ns()}",flush=True)
           FUSE(ShardFS(),MNT,foreground=True,direct_io=True,allow_other=True,nothreads=False)
           PYEOF
           python3 -m py_compile /tmp/shardfs.py
-          echo "[LOG] WHAT: SHARDFS_COMPILED | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DAEMON_COMPILED | WHEN: $(date +%s%N)"
 
-      - name: Launch ShardFS + Assert File
+      - name: Self-Heal (Hard Delete via AetherClient probe)
         run: |
           set -e
-          sudo env REMOTE=$REMOTE VSIZE=$VSIZE nohup python3 /tmp/shardfs.py > /tmp/shardfs.log 2>&1 &
-          sleep 8
+          if [ "${{ github.event.inputs.force_reinstall }}" = "true" ]; then
+            sudo python3 - <<'PYEOF' || true
+          import os,re,requests
+          from requests.adapters import HTTPAdapter
+          BASE="https://app.drime.cloud/"; ROOT=BASE+"api/v1"
+          toks=[t for t in [os.environ.get("DRIME"),os.environ.get("DRIME1"),os.environ.get("DRIME2"),os.environ.get("DRIME3")] if t]
+          for tk in toks:
+              s=requests.Session(); s.mount("https://",HTTPAdapter(pool_maxsize=16))
+              s.headers.update({"Authorization":"Bearer "+tk,"Accept":"application/json"})
+              r=s.get(ROOT+"/drive/file-entries",params={"perPage":1000,"page":1},timeout=30); items=r.json().get("data",[])
+              vm=None
+              for it in items:
+                  if it.get("name")=="vm" and it.get("type")=="folder": vm=str(it.get("id"))
+              if not vm: continue
+              page=1
+              while True:
+                  r=s.get(ROOT+"/drive/file-entries",params={"folderId":vm,"perPage":1000,"page":page},timeout=30)
+                  j=r.json(); d=j.get("data",[])
+                  eids=[str(x.get("id")) for x in d if re.match(r"shard_\d+$",str(x.get("name","")))]
+                  if eids:
+                      s.post(ROOT+"/file-entries/delete",json={"entryIds":eids,"deleteForever":True},timeout=60)
+                  cp=j.get("current_page",1); lp=j.get("last_page",1)
+                  if cp>=lp: break
+                  page=cp+1
+              print("[LOG] WHAT: SELF_HEAL_HARDDELETE | DONE | WHEN: 0")
+          PYEOF
+          fi
+          echo "[LOG] WHAT: SELF_HEAL_STEP_DONE | WHEN: $(date +%s%N)"
+        env:
+          DRIME:  ${{ secrets.DRIME }}
+          DRIME1: ${{ secrets.DRIME1 }}
+          DRIME2: ${{ secrets.DRIME2 }}
+          DRIME3: ${{ secrets.DRIME3 }}
+
+      - name: Mode + Size Detect (via AetherClient listing)
+        run: |
+          set -e
+          COUNT=$(sudo python3 - <<'PYEOF'
+          import os,re,requests
+          BASE="https://app.drime.cloud/"; ROOT=BASE+"api/v1"
+          toks=[t for t in [os.environ.get("DRIME"),os.environ.get("DRIME1"),os.environ.get("DRIME2"),os.environ.get("DRIME3")] if t]
+          n=0
+          for tk in toks:
+              s=requests.Session(); s.headers.update({"Authorization":"Bearer "+tk,"Accept":"application/json"})
+              r=s.get(ROOT+"/drive/file-entries",params={"perPage":1000,"page":1},timeout=30); items=r.json().get("data",[])
+              vm=None
+              for it in items:
+                  if it.get("name")=="vm" and it.get("type")=="folder": vm=str(it.get("id"))
+              if not vm: continue
+              r=s.get(ROOT+"/drive/file-entries",params={"folderId":vm,"perPage":1000,"page":1},timeout=30)
+              n+=len([x for x in r.json().get("data",[]) if re.match(r"shard_\d+$",str(x.get("name","")))])
+          print(n)
+          PYEOF
+          )
+          if [ "$COUNT" -gt 0 ]; then MODE=BOOT; else MODE=FIRST; fi
+          N=$ACCOUNTS_COUNT
+          echo "MODE=$MODE" >> $GITHUB_ENV
+          echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | SHARDS: $COUNT | WHEN: $(date +%s%N)"
+        env:
+          DRIME:  ${{ secrets.DRIME }}
+          DRIME1: ${{ secrets.DRIME1 }}
+          DRIME2: ${{ secrets.DRIME2 }}
+          DRIME3: ${{ secrets.DRIME3 }}
+
+      - name: Set VSIZE + Resolve Media
+        run: |
+          set -e
+          N=1
+          [ -n "$DRIME1" ] && N=2; [ -n "$DRIME2" ] && N=3; [ -n "$DRIME3" ] && N=4
+          if [ "$N" -eq 1 ]; then VSIZE=18; else VSIZE=$((18*N-4)); fi
+          echo "VSIZE=$VSIZE" >> $GITHUB_ENV
+          echo "ACCOUNTS_COUNT=$N" >> $GITHUB_ENV
+          if [ "$MODE" = "FIRST" ]; then
+            sudo mkdir -p /mnt/drime
+            sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
+            sudo apt-get install -y --no-install-recommends rclone || true
+            curl https://rclone.org/install.sh | sudo bash
+            CONF=/tmp/rclone.conf; : > $CONF
+            printf '[drime0]\ntype = drime\naccess_token = %s\nhard_delete = true\n' "$DRIME" >> $CONF
+            sudo rclone mount drime0: /mnt/drime --config /tmp/rclone.conf --vfs-cache-mode off --allow-other --daemon || true
+            sleep 8
+            if [ -f /mnt/drime/iso/ubuntu.iso ]; then
+              echo "CDROM=/mnt/drime/iso/ubuntu.iso" >> $GITHUB_ENV; echo "MEDIASRC=drime" >> $GITHUB_ENV
+            else
+              echo "CDROM=https://releases.ubuntu.com/resolute/ubuntu-26.04.1-live-server-amd64.iso" >> $GITHUB_ENV; echo "MEDIASRC=https" >> $GITHUB_ENV
+            fi
+          fi
+          echo "[LOG] WHAT: MEDIA_AND_SIZE | VSIZE: ${VSIZE}G | MODE: $MODE | WHEN: $(date +%s%N)"
+        env:
+          DRIME:  ${{ secrets.DRIME }}
+          DRIME1: ${{ secrets.DRIME1 }}
+          DRIME2: ${{ secrets.DRIME2 }}
+          DRIME3: ${{ secrets.DRIME3 }}
+
+      - name: Launch ShardFS + Assert
+        run: |
+          set -e
+          sudo env REMOTE=x VSIZE=$VSIZE DRIME=$DRIME DRIME1=$DRIME1 DRIME2=$DRIME2 DRIME3=$DRIME3 \
+            nohup python3 /tmp/shardfs.py > /tmp/shardfs.log 2>&1 &
+          sleep 10
           cat /tmp/shardfs.log
-          grep -q SHARDFS_READY /tmp/shardfs.log
+          grep -q AETHERCLIENT_READY /tmp/shardfs.log
           mountpoint -q /mnt/sharddisk || { echo "[LOG] WHAT: SHARDFS_MOUNT_DEAD | WHEN: $(date +%s%N)"; exit 1; }
-          ls -l /mnt/sharddisk/disk.img
-          echo "[LOG] WHAT: SHARDFS_ALIVE | WHEN: $(date +%s%N)"
-
-      - name: Probe Disk
-        run: |
-          set -e
           qemu-img info /mnt/sharddisk/disk.img
-          echo "[LOG] WHAT: DISK_PROBE_VERIFIED | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: SHARDFS_ALIVE | DISK_PROBE_VERIFIED | WHEN: $(date +%s%N)"
+        env:
+          DRIME:  ${{ secrets.DRIME }}
+          DRIME1: ${{ secrets.DRIME1 }}
+          DRIME2: ${{ secrets.DRIME2 }}
+          DRIME3: ${{ secrets.DRIME3 }}
 
-      - name: Boot VM (Disk=Drime Shards, VNC 5900)
+      - name: Boot VM (8Gi guest, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
-          ARGS="-m 12288 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
+          ARGS="-m 8192 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
           ARGS="$ARGS -drive file=/mnt/sharddisk/disk.img,if=virtio,format=raw,cache=none"
           if [ "$MODE" = "FIRST" ]; then ARGS="$ARGS -boot order=dc -cdrom $CDROM"; else ARGS="$ARGS -boot order=c"; fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | MEDIA: $MEDIASRC | RAM_USED_BY_STACK: ~0 | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
-          ( while true; do sleep 300; \
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | MEDIA: $MEDIASRC | TRANSPORT: AetherClient | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          ( while true; do sleep 120; \
             echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
             free -h | head -2 || true; \
-            echo "[LOG] WHAT: SHARD_COUNT | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"; \
           done ) &
           HB=$!
           sudo qemu-system-x86_64 $ARGS &
@@ -257,20 +363,15 @@ jobs:
           echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
           exit $EXIT
 
-      - name: Drain + ISO Cleanup + Unmount (ALWAYS)
+      - name: Drain + Cleanup (ALWAYS)
         if: always()
         run: |
           echo "[LOG] WHAT: DRAIN_START | WHEN: $(date +%s%N)"
           sudo pkill -TERM -f qemu-system-x86_64 || true
           sleep 3
           sudo pkill -TERM -f shardfs.py || true
-          sleep 15
-          tail -20 /tmp/shardfs.log || true
-          echo "[LOG] WHAT: FINAL_SHARDS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
-          if [ "$MODE" = "FIRST" ] && [ "$VMEXIT" = "0" ] && [ "$MEDIASRC" = "drime" ]; then
-            rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
-            echo "[LOG] WHAT: ISO_CLEANUP | 3.2G quota freed | WHEN: $(date +%s%N)"
-          fi
+          sleep 20
+          tail -30 /tmp/shardfs.log || true
           sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
           sudo umount /mnt/sharddisk || sudo fusermount3 -u /mnt/sharddisk || true
           echo "[LOG] WHAT: DRAIN_DONE | WHEN: $(date +%s%N)"
