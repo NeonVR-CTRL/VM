@@ -1,4 +1,4 @@
-name: AetherGrid AIO (Pure v38)
+name: AetherGrid AIO (Pure v39 Debug)
 
 on:
   workflow_dispatch:
@@ -39,7 +39,7 @@ jobs:
           sleep 15
           echo "[LOG] WHAT: NETBIRD_UP | WHEN: $(date +%s%N)"
 
-      - name: Write Pure AetherGrid v38 (URL metadata fetch)
+      - name: Write Pure AetherGrid v39 (Raw error logging)
         run: |
           cat > /tmp/pure_aethergrid.py <<'PYEOF'
           import os,sys,stat,errno,zlib,json,threading,time,signal,traceback,subprocess
@@ -58,12 +58,8 @@ jobs:
           pool=ThreadPoolExecutor(8)
           lock=threading.Lock(); commit_req=threading.Event(); commit_done=threading.Event()
           index={}; buf={}; segseq=[0]; idxseq=[0]; seglru=OrderedDict(); segurl={}
-          RAWLOGGED=set()
           
           def log(w,v): print(f"[LOG] WHAT: {w} | {v} | WHEN: {time.time_ns()}",flush=True)
-          def raw(tag,j):
-              if tag not in RAWLOGGED:
-                  RAWLOGGED.add(tag); log("RAW_"+tag, json.dumps(j)[:900])
           def walk(o):
               st=[o]
               while st:
@@ -100,7 +96,6 @@ jobs:
           def get_file_url(fid):
               r=S.get(API+f"/file-entries/{fid}",timeout=60)
               r.raise_for_status(); j=r.json()
-              raw("FILEMETA",j)
               return digurl(j)
           FOLDERS={}
           def folder(path):
@@ -113,20 +108,37 @@ jobs:
                   items=[it for it in list_dir(cur) if it.get("name")==leaf]
                   if items: cur=str(items[0]["id"])
                   else:
-                      r=S.post(API+"/folders",json={"name":leaf,"parent_id":int(cur) if cur else 0,"workspace_id":0},timeout=60)
-                      r.raise_for_status(); j=r.json()
-                      cur=str(dig(j,"id"))
+                      # Try multiple field name variations
+                      payloads=[
+                          {"name":leaf,"parent_id":int(cur) if cur else None},
+                          {"name":leaf,"parent_id":int(cur) if cur else 0},
+                          {"Name":leaf,"ParentID":int(cur) if cur else 0},
+                          {"name":leaf,"parent_id":cur if cur else None},
+                      ]
+                      success=False
+                      for payload in payloads:
+                          try:
+                              log("FOLDER_CREATE_REQ", json.dumps(payload))
+                              r=S.post(API+"/folders",json=payload,timeout=60)
+                              log("FOLDER_CREATE_RESP", f"status:{r.status_code} body:{r.text[:500]}")
+                              if r.status_code==200 or r.status_code==201:
+                                  j=r.json()
+                                  cur=str(dig(j,"id"))
+                                  success=True
+                                  break
+                          except Exception as e:
+                              log("FOLDER_CREATE_ERR", str(e))
+                      if not success:
+                          raise RuntimeError(f"Failed to create folder {leaf}")
                   FOLDERS[key]=cur
               FOLDERS[path]=cur; return cur
           def mp_create(fname,parent):
               r=S.post(API+"/s3/multipart/create",json={"Filename":fname,"Mime":"application/octet-stream","Size":0,"Extension":"bin","ParentID":int(parent),"RelativePath":fname,"WorkspaceID":0},timeout=60)
               r.raise_for_status(); j=r.json()
-              raw("MPCREATE",j)
               return str(dig(j,"uploadid","upload_id")), str(dig(j,"key"))
           def mp_sign(up,key,nums):
               r=S.post(API+"/s3/multipart/batch-sign-part-urls",json={"UploadID":up,"Key":key,"PartNumbers":nums},timeout=60)
               r.raise_for_status(); j=r.json()
-              raw("MPSIGN",j)
               m={}
               for d in walk(j):
                   pn=None; url=None
@@ -141,7 +153,6 @@ jobs:
           def mp_complete(up,key,parts):
               r=S.post(API+"/s3/multipart/complete",json={"UploadID":up,"Key":key,"Parts":parts},timeout=120)
               r.raise_for_status(); j=r.json()
-              raw("MPCOMPLETE",j)
               return digurl(j)
           def upload_blob(name,data,parent):
               up,key=mp_create(name,parent)
