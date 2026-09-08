@@ -1,4 +1,4 @@
-name: AetherGrid AIO (Pure v37)
+name: AetherGrid AIO (Pure v38)
 
 on:
   workflow_dispatch:
@@ -39,7 +39,7 @@ jobs:
           sleep 15
           echo "[LOG] WHAT: NETBIRD_UP | WHEN: $(date +%s%N)"
 
-      - name: Write Pure AetherGrid (A to Z, zero 3rd-party)
+      - name: Write Pure AetherGrid v38 (URL metadata fetch)
         run: |
           cat > /tmp/pure_aethergrid.py <<'PYEOF'
           import os,sys,stat,errno,zlib,json,threading,time,signal,traceback,subprocess
@@ -58,8 +58,12 @@ jobs:
           pool=ThreadPoolExecutor(8)
           lock=threading.Lock(); commit_req=threading.Event(); commit_done=threading.Event()
           index={}; buf={}; segseq=[0]; idxseq=[0]; seglru=OrderedDict(); segurl={}
+          RAWLOGGED=set()
           
           def log(w,v): print(f"[LOG] WHAT: {w} | {v} | WHEN: {time.time_ns()}",flush=True)
+          def raw(tag,j):
+              if tag not in RAWLOGGED:
+                  RAWLOGGED.add(tag); log("RAW_"+tag, json.dumps(j)[:900])
           def walk(o):
               st=[o]
               while st:
@@ -93,6 +97,11 @@ jobs:
                   if len(items)<200: break
                   page+=1
               return out
+          def get_file_url(fid):
+              r=S.get(API+f"/file-entries/{fid}",timeout=60)
+              r.raise_for_status(); j=r.json()
+              raw("FILEMETA",j)
+              return digurl(j)
           FOLDERS={}
           def folder(path):
               if path in FOLDERS: return FOLDERS[path]
@@ -112,10 +121,12 @@ jobs:
           def mp_create(fname,parent):
               r=S.post(API+"/s3/multipart/create",json={"Filename":fname,"Mime":"application/octet-stream","Size":0,"Extension":"bin","ParentID":int(parent),"RelativePath":fname,"WorkspaceID":0},timeout=60)
               r.raise_for_status(); j=r.json()
+              raw("MPCREATE",j)
               return str(dig(j,"uploadid","upload_id")), str(dig(j,"key"))
           def mp_sign(up,key,nums):
               r=S.post(API+"/s3/multipart/batch-sign-part-urls",json={"UploadID":up,"Key":key,"PartNumbers":nums},timeout=60)
               r.raise_for_status(); j=r.json()
+              raw("MPSIGN",j)
               m={}
               for d in walk(j):
                   pn=None; url=None
@@ -130,6 +141,7 @@ jobs:
           def mp_complete(up,key,parts):
               r=S.post(API+"/s3/multipart/complete",json={"UploadID":up,"Key":key,"Parts":parts},timeout=120)
               r.raise_for_status(); j=r.json()
+              raw("MPCOMPLETE",j)
               return digurl(j)
           def upload_blob(name,data,parent):
               up,key=mp_create(name,parent)
@@ -154,10 +166,16 @@ jobs:
           def load_head():
               fid=folder("lob/idx")
               names=sorted(i["name"] for i in list_dir(fid))
-              if not names: return
+              if not names: 
+                  log("HEAD_LOADED", "EMPTY"); 
+                  return
               idxseq[0]=int(names[-1].split(".")[0]) if names[-1].split(".")[0].isdigit() else 0
               it=[i for i in list_dir(fid) if i["name"]==names[-1]][0]
               u=it.get("url") or digurl(it)
+              if not u:
+                  u=get_file_url(it["id"])
+              if not u:
+                  log("HEAD_URL_MISSING", "treating as empty disk"); return
               r=S.get(BASE+u if u.startswith("/") else u,timeout=120); r.raise_for_status()
               d=json.loads(zlib.decompress(r.content))
               index.update(d["index"]); segseq[0]=d.get("segseq",0)
@@ -202,8 +220,12 @@ jobs:
                   u=segurl.get(str(seq),"")
               if not u:
                   it=[i for i in list_dir(folder("lob/seg")) if i["name"]==f"seg{seq:010d}.bin"]
-                  u=it[0].get("url") or digurl(it[0]) if it else ""
-                  with lock: segurl[str(seq)]=u
+                  if it:
+                      u=it[0].get("url") or digurl(it[0])
+                      if not u: u=get_file_url(it[0]["id"])
+                      with lock: segurl[str(seq)]=u or ""
+              if not u:
+                  log("SEG_URL_MISSING", f"seq:{seq}"); return b"\x00"*1024
               r=S.get(BASE+u if u.startswith("/") else u,timeout=120); r.raise_for_status()
               d=r.content
               with lock:
