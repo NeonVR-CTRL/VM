@@ -1,4 +1,4 @@
-name: AetherGrid AIO (Adaptive Shard v21)
+name: AetherGrid AIO (ShardFS v22)
 
 on:
   workflow_dispatch:
@@ -21,15 +21,17 @@ jobs:
       DRIME3: ${{ secrets.DRIME3 }}
 
     steps:
-      - name: Install Minimal Stack
+      - name: Install Minimal Stack (+ fusepy)
         run: |
           set -e
           sudo apt-get update -y
           sudo apt-get remove -y rclone || true
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 qemu-utils qemu-system-common fuse3 wget curl ca-certificates python3
+            qemu-system-x86 qemu-utils qemu-system-common fuse3 fuse wget curl ca-certificates python3 python3-pip
           curl https://rclone.org/install.sh | sudo bash
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
+          pip3 install --break-system-packages fusepy || sudo pip3 install fusepy
+          python3 -c "import fuse; print('fusepy OK')"
           echo "[LOG] WHAT: INSTALL_DONE | WHEN: $(date +%s%N)"
 
       - name: NetBird Mesh Up
@@ -122,16 +124,15 @@ jobs:
           mountpoint -q /mnt/drime
           echo "[LOG] WHAT: DRIME_MOUNT_OK | WHEN: $(date +%s%N)"
 
-      - name: Write Adaptive AetherShard Daemon
+      - name: Write ShardFS Daemon (FUSE single-file block device)
         run: |
-          cat > /tmp/aethershard.py <<'PYEOF'
-          import os,socket,struct,threading,subprocess,time,signal,traceback
+          cat > /tmp/shardfs.py <<'PYEOF'
+          import os,stat,errno,subprocess,threading,time,signal,traceback
           from concurrent.futures import ThreadPoolExecutor
+          from fuse import FUSE, FuseOSError, Operations
           CONF="/tmp/rclone.conf"; REMOTE=os.environ["REMOTE"]; VSIZE=int(os.environ["VSIZE"])*1024**3
-          SHARD=4*1024*1024; PORT=10809; DIRTY_MAX=256*1024*1024
+          SHARD=4*1024*1024; DIRTY_MAX=256*1024*1024; MNT="/mnt/sharddisk"
           RC=["rclone","--config",CONF]
-          OPTMAGIC=struct.pack(">Q",0x49484156454f5054)
-          REP_MAGIC=0x3e889044565bf931; REP_ACK=1; REP_INFO=3; REP_ERR_UNSUP=0x80000001
           lock=threading.Lock(); cond=threading.Condition(lock)
           dirty={}; touched={}; uploading={}; fetching=set()
           def name(i): return f"vm/shard_{i:06d}"
@@ -171,6 +172,12 @@ jobs:
                   fetching.discard(i)
                   if i not in dirty: dirty[i]=b; touched[i]=time.time()
                   return dirty[i]
+          def read_at(off,length):
+              out=bytearray(); pos=0
+              while pos<length:
+                  i=off//SHARD; s=off-i*SHARD; n=min(SHARD-s,length-pos)
+                  out+=shard_buf(i)[s:s+n]; off+=n; pos+=n
+              return bytes(out)
           def write_at(off,data):
               pos=0
               while pos<len(data):
@@ -180,95 +187,62 @@ jobs:
                       b[s:s+n]=data[pos:pos+n]; touched[i]=time.time()
                       while len(dirty)*SHARD>DIRTY_MAX: cond.wait(0.2)
                   off+=n; pos+=n
-          def read_at(off,length):
-              out=bytearray(); pos=0
-              while pos<length:
-                  i=off//SHARD; s=off-i*SHARD; n=min(SHARD-s,length-pos)
-                  out+=shard_buf(i)[s:s+n]; off+=n; pos+=n
-              return bytes(out)
-          def rd(f,n):
-              b=f.read(n); return b if len(b)==n else None
-          def handle(conn):
-              try:
-                  f=conn.makefile("rwb")
-                  f.write(b"NBDMAGIC"+OPTMAGIC+struct.pack(">H",1)); f.flush()
-                  if rd(f,4) is None: return
-                  while True:
-                      pre=rd(f,8)
-                      if pre is None: return
-                      if pre==OPTMAGIC:
-                          tln=rd(f,8)
-                          if tln is None: return
-                          opt,ln=struct.unpack(">II",tln)
-                          if ln and rd(f,ln) is None: return
-                          if opt==1:
-                              f.write(struct.pack(">Q",VSIZE)+struct.pack(">I",0x0005)+b"\x00"*124); f.flush()
-                          elif opt in (6,7):
-                              f.write(struct.pack(">Q",REP_MAGIC)+struct.pack(">II",REP_INFO,12)+struct.pack(">HQH",0,VSIZE,0x0005)); f.flush()
-                              f.write(struct.pack(">Q",REP_MAGIC)+struct.pack(">II",REP_ACK,0)); f.flush()
-                          else:
-                              f.write(struct.pack(">Q",REP_MAGIC)+struct.pack(">II",REP_ERR_UNSUP,0)); f.flush()
-                      else:
-                          rest=rd(f,20)
-                          if rest is None: return
-                          magic,typ,handle,off,ln=struct.unpack(">IIQQI",pre+rest)
-                          if typ==0:
-                              f.write(struct.pack(">IIQ",0x67446698,0,handle)+read_at(off,ln)); f.flush()
-                          elif typ==1:
-                              d=rd(f,ln)
-                              if d is None: return
-                              write_at(off,d)
-                              f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
-                          elif typ==3:
-                              drain(); f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
-                          elif typ==2:
-                              drain(); f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush(); return
-                          else:
-                              f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
-              except Exception:
-                  traceback.print_exc()
-                  return
-              finally:
-                  try: conn.close()
-                  except Exception: pass
+          class ShardFS(Operations):
+              def getattr(self,path,fh=None):
+                  if path=="/": return dict(st_mode=(stat.S_IFDIR|0o755),st_nlink=2)
+                  if path=="/disk.img": return dict(st_mode=(stat.S_IFREG|0o600),st_nlink=1,st_size=VSIZE,st_blksize=4096,st_blocks=VSIZE//512)
+                  raise FuseOSError(errno.ENOENT)
+              def readdir(self,path,fh):
+                  for p in (".","..","disk.img"): yield p
+              def open(self,path,flags):
+                  if path!="/disk.img": raise FuseOSError(errno.ENOENT)
+                  return 0
+              def read(self,path,size,offset,fh):
+                  if offset>=VSIZE: return b""
+                  size=min(size,VSIZE-offset)
+                  return read_at(offset,size)
+              def write(self,path,data,offset,fh):
+                  write_at(offset,bytes(data))
+                  return len(data)
+              def flush(self,path,fh): return 0
+              def fsync(self,path,datasync,fh): drain(); return 0
+              def release(self,path,fh): drain(); return 0
+              def statfs(self,path):
+                  return dict(f_bsize=4096,f_frsize=4096,f_blocks=VSIZE//4096,f_bfree=0,f_bavail=0,f_files=1,f_ffree=0)
+              def truncate(self,path,length,fh=None): return 0
           def on_term(sig,frm):
               threading.Thread(target=lambda:(drain(),os._exit(0))).start()
           signal.signal(signal.SIGTERM,on_term); signal.signal(signal.SIGINT,on_term)
           threading.Thread(target=uploader,daemon=True).start()
-          srv=socket.socket(); srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-          srv.bind(("127.0.0.1",PORT)); srv.listen(4)
-          print(f"[LOG] WHAT: AETHERSHARD_READY | PORT: {PORT} | VSIZE: {VSIZE} | WHEN: {time.time_ns()}",flush=True)
-          while True:
-              conn,_=srv.accept(); threading.Thread(target=handle,args=(conn,),daemon=True).start()
+          os.makedirs(MNT,exist_ok=True)
+          print(f"[LOG] WHAT: SHARDFS_READY | MNT: {MNT} | VSIZE: {VSIZE} | WHEN: {time.time_ns()}",flush=True)
+          FUSE(ShardFS(),MNT,foreground=True,direct_io=True,allow_other=True,nothreads=False)
           PYEOF
-          python3 -m py_compile /tmp/aethershard.py
-          echo "[LOG] WHAT: DAEMON_COMPILED | WHEN: $(date +%s%N)"
+          python3 -m py_compile /tmp/shardfs.py
+          echo "[LOG] WHAT: SHARDFS_COMPILED | WHEN: $(date +%s%N)"
 
-      - name: Launch Daemon + Assert Alive
+      - name: Launch ShardFS + Assert File
         run: |
           set -e
-          REMOTE=$REMOTE VSIZE=$VSIZE nohup python3 /tmp/aethershard.py > /tmp/aethershard.log 2>&1 &
-          sleep 6
-          cat /tmp/aethershard.log
-          grep -q AETHERSHARD_READY /tmp/aethershard.log
-          (exec 3<>/dev/tcp/127.0.0.1/10809) 2>/dev/null || { echo "[LOG] WHAT: NBD_PORT_DEAD | WHEN: $(date +%s%N)"; exit 1; }
-          echo "[LOG] WHAT: DAEMON_ALIVE | WHEN: $(date +%s%N)"
+          sudo env REMOTE=$REMOTE VSIZE=$VSIZE nohup python3 /tmp/shardfs.py > /tmp/shardfs.log 2>&1 &
+          sleep 8
+          cat /tmp/shardfs.log
+          grep -q SHARDFS_READY /tmp/shardfs.log
+          mountpoint -q /mnt/sharddisk || { echo "[LOG] WHAT: SHARDFS_MOUNT_DEAD | WHEN: $(date +%s%N)"; exit 1; }
+          ls -l /mnt/sharddisk/disk.img
+          echo "[LOG] WHAT: SHARDFS_ALIVE | WHEN: $(date +%s%N)"
 
-      - name: Probe NBD (Timeout-Guarded, Gating)
+      - name: Probe Disk (Plain File, No Wire)
         run: |
-          if timeout 20 qemu-img info nbd:127.0.0.1:10809; then
-            echo "[LOG] WHAT: NBD_PROTOCOL_VERIFIED | ADAPTIVE_LOOP_OK | WHEN: $(date +%s%N)"
-          else
-            echo "[LOG] WHAT: NBD_PROBE_FAIL | WHEN: $(date +%s%N)"
-            tail -30 /tmp/aethershard.log || true
-            exit 1
-          fi
+          set -e
+          qemu-img info /mnt/sharddisk/disk.img
+          echo "[LOG] WHAT: DISK_PROBE_VERIFIED | WHEN: $(date +%s%N)"
 
-      - name: Boot VM (Disk = Drime Shards RAW, VNC 5900)
+      - name: Boot VM (Disk = ShardFS file, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 12288 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
-          ARGS="$ARGS -drive file=nbd:127.0.0.1:10809,if=virtio,format=raw,cache=none"
+          ARGS="$ARGS -drive file=/mnt/sharddisk/disk.img,if=virtio,format=raw,cache=none"
           if [ "$MODE" = "FIRST" ]; then
             if [ "$ISO_SRC" = "drime" ]; then ARGS="$ARGS -boot order=dc -cdrom /mnt/drime/iso/ubuntu.iso"
             else ARGS="$ARGS -boot order=dc -cdrom https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; fi
@@ -296,13 +270,14 @@ jobs:
           echo "[LOG] WHAT: DRAIN_START | WHEN: $(date +%s%N)"
           sudo pkill -TERM -f qemu-system-x86_64 || true
           sleep 3
-          pkill -TERM -f aethershard.py || true
+          sudo pkill -TERM -f shardfs.py || true
           sleep 15
-          tail -20 /tmp/aethershard.log || true
+          tail -20 /tmp/shardfs.log || true
           echo "[LOG] WHAT: FINAL_SHARDS | N: $(rclone lsf --config /tmp/rclone.conf "${REMOTE}:vm" 2>/dev/null | wc -l) | WHEN: $(date +%s%N)"
           if [ "$MODE" = "FIRST" ] && [ "$VMEXIT" = "0" ] && [ "$ACCOUNTS" -eq 1 ]; then
             rclone deletefile --config /tmp/rclone.conf "${REMOTE}:iso/ubuntu.iso" || true
             echo "[LOG] WHAT: ISO_CLEANUP | quota freed for 18G | WHEN: $(date +%s%N)"
           fi
           sudo umount /mnt/drime || sudo fusermount3 -u /mnt/drime || true
+          sudo umount /mnt/sharddisk || sudo fusermount3 -u /mnt/sharddisk || true
           echo "[LOG] WHAT: DRAIN_DONE | WHEN: $(date +%s%N)"
