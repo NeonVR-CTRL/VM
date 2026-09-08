@@ -1,4 +1,4 @@
-name: AetherGrid AIO (AetherShard v17)
+name: AetherGrid AIO (AetherShard v18)
 
 on:
   workflow_dispatch:
@@ -65,12 +65,12 @@ jobs:
           echo "ACCOUNTS=$N"    >> $GITHUB_ENV
           echo "[LOG] WHAT: CONFIG_BUILT | ACCOUNTS: $N | WHEN: $(date +%s%N)"
 
-      - name: Create Real Parent Folders (parentId Fix)
+      - name: Create Real Parent Folders
         run: |
           set -e
           rclone mkdir --config /tmp/rclone.conf "${REMOTE}:vm"  || true
           rclone mkdir --config /tmp/rclone.conf "${REMOTE}:iso" || true
-          echo "[LOG] WHAT: PARENT_FOLDERS_READY | vm/ + iso/ | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: PARENT_FOLDERS_READY | WHEN: $(date +%s%N)"
 
       - name: Self-Heal + Mode + Virtual Size
         run: |
@@ -92,22 +92,21 @@ jobs:
           echo "VSIZE=$VSIZE" >> $GITHUB_ENV
           echo "[LOG] WHAT: MODE_DETECT | MODE: $MODE | VSIZE: ${VSIZE}G | WHEN: $(date +%s%N)"
 
-      - name: Stream ISO To Drime iso/ (rcat pipe) + HTTPS Fallback Flag
+      - name: Stream ISO To Drime iso/ + HTTPS Fallback
         if: env.MODE == 'FIRST'
         run: |
           HAS=$(rclone lsf --config /tmp/rclone.conf "${REMOTE}:iso" 2>/dev/null | grep -c '^ubuntu.iso$' || true)
           if [ "${HAS:-0}" != "0" ]; then
             echo "ISO_SRC=drime" >> $GITHUB_ENV
-            echo "[LOG] WHAT: ISO_REUSE | FROM: Drime iso/ | WHEN: $(date +%s%N)"
+            echo "[LOG] WHAT: ISO_REUSE | WHEN: $(date +%s%N)"
           else
-            echo "[LOG] WHAT: ISO_STREAM_TO_DRIME | VIA: rcat into iso/ | WHEN: $(date +%s%N)"
+            echo "[LOG] WHAT: ISO_STREAM_TO_DRIME | WHEN: $(date +%s%N)"
             if wget -qO- "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso" \
                | rclone --config /tmp/rclone.conf rcat "${REMOTE}:iso/ubuntu.iso"; then
               echo "ISO_SRC=drime" >> $GITHUB_ENV
-              echo "[LOG] WHAT: ISO_ON_DRIME | WHEN: $(date +%s%N)"
             else
               echo "ISO_SRC=https" >> $GITHUB_ENV
-              echo "[LOG] WHAT: ISO_FALLBACK | WHY: drime multipart refused | SRC: https direct | WHEN: $(date +%s%N)"
+              echo "[LOG] WHAT: ISO_FALLBACK | SRC: https direct | WHEN: $(date +%s%N)"
             fi
           fi
 
@@ -123,7 +122,7 @@ jobs:
           mountpoint -q /mnt/drime
           echo "[LOG] WHAT: DRIME_MOUNT_OK | WHEN: $(date +%s%N)"
 
-      - name: Write AetherShard Daemon
+      - name: Write AetherShard Daemon (Fixed-Newstyle NBD)
         run: |
           cat > /tmp/aethershard.py <<'PYEOF'
           import os,socket,struct,threading,subprocess,time,signal
@@ -131,16 +130,16 @@ jobs:
           CONF="/tmp/rclone.conf"; REMOTE=os.environ["REMOTE"]; VSIZE=int(os.environ["VSIZE"])*1024**3
           SHARD=4*1024*1024; PORT=10809; DIRTY_MAX=256*1024*1024
           RC=["rclone","--config",CONF]
+          REP_MAGIC=0x3e889044565bf931; REP_ERR_UNSUP=0x80000001
           lock=threading.Lock(); cond=threading.Condition(lock)
-          dirty={}; touched={}; uploading={}; fetching=set(); stats={"put":0,"get":0}
+          dirty={}; touched={}; uploading={}; fetching=set()
           def name(i): return f"vm/shard_{i:06d}"
           def put(i,data):
               p=subprocess.run(RC+["rcat",f"{REMOTE}:{name(i)}"],input=bytes(data),capture_output=True)
               return p.returncode==0
           def get(i):
               p=subprocess.run(RC+["cat",f"{REMOTE}:{name(i)}"],capture_output=True)
-              if p.returncode==0 and p.stdout:
-                  stats["get"]+=1; return bytearray(p.stdout)
+              if p.returncode==0 and p.stdout: return bytearray(p.stdout)
               return bytearray(SHARD)
           def uploader():
               pool=ThreadPoolExecutor(4); futs={}
@@ -151,7 +150,7 @@ jobs:
                           uploading[i]=dirty.pop(i); futs[i]=pool.submit(put,i,uploading[i])
                       for i in [i for i,f in futs.items() if f.done()]:
                           f=futs.pop(i); ok=f.result()
-                          if ok: stats["put"]+=1; uploading.pop(i,None)
+                          if ok: uploading.pop(i,None)
                           else: dirty[i]=uploading.pop(i); touched[i]=time.time()
                       cond.notify_all()
                   time.sleep(0.5)
@@ -186,32 +185,52 @@ jobs:
                   i=off//SHARD; s=off-i*SHARD; n=min(SHARD-s,length-pos)
                   out+=shard_buf(i)[s:s+n]; off+=n; pos+=n
               return bytes(out)
+          def rd(f,n):
+              b=f.read(n); return b if len(b)==n else None
           def handle(conn):
-              f=conn.makefile("rwb")
-              f.write(b"NBDMAGIC"+struct.pack(">Q",0x49484156454f5054)+struct.pack(">H",0)); f.flush()
-              opt=struct.unpack(">I",f.read(4))[0]
-              f.write(struct.pack(">Q",VSIZE)+struct.pack(">I",0x0005)+b"\x00"*124); f.flush()
-              while True:
-                  hdr=f.read(28)
-                  if len(hdr)<28: return
-                  magic,typ,handle,off,ln=struct.unpack(">IIQQI",hdr)
-                  if typ==0:
-                      f.write(struct.pack(">IIQ",0x67446698,0,handle)+read_at(off,ln)); f.flush()
-                  elif typ==1:
-                      d=f.read(ln); write_at(off,d)
-                      f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
-                  elif typ==3:
-                      drain(); f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
-                  elif typ==2:
-                      drain(); f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush(); return
-                  else:
-                      f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
+              try:
+                  f=conn.makefile("rwb")
+                  f.write(b"NBDMAGIC"+struct.pack(">Q",0x49484156454f5054)+struct.pack(">H",1)); f.flush()
+                  if rd(f,4) is None: return
+                  while True:
+                      if rd(f,8) is None: return
+                      tln=rd(f,8)
+                      if tln is None: return
+                      opt,ln=struct.unpack(">II",tln)
+                      if ln: 
+                          if rd(f,ln) is None: return
+                      if opt==1:
+                          f.write(struct.pack(">Q",VSIZE)+struct.pack(">I",0x0005)+b"\x00"*124); f.flush(); break
+                      else:
+                          f.write(struct.pack(">Q",REP_MAGIC)+struct.pack(">II",REP_ERR_UNSUP,0)); f.flush()
+                  while True:
+                      hdr=rd(f,28)
+                      if hdr is None: return
+                      magic,typ,handle,off,ln=struct.unpack(">IIQQI",hdr)
+                      if typ==0:
+                          f.write(struct.pack(">IIQ",0x67446698,0,handle)+read_at(off,ln)); f.flush()
+                      elif typ==1:
+                          d=rd(f,ln)
+                          if d is None: return
+                          write_at(off,d)
+                          f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
+                      elif typ==3:
+                          drain(); f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
+                      elif typ==2:
+                          drain(); f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush(); return
+                      else:
+                          f.write(struct.pack(">IIQ",0x67446698,0,handle)); f.flush()
+              except Exception:
+                  return
+              finally:
+                  try: conn.close()
+                  except Exception: pass
           def on_term(sig,frm):
               threading.Thread(target=lambda:(drain(),os._exit(0))).start()
           signal.signal(signal.SIGTERM,on_term); signal.signal(signal.SIGINT,on_term)
           threading.Thread(target=uploader,daemon=True).start()
           srv=socket.socket(); srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-          srv.bind(("127.0.0.1",PORT)); srv.listen(1)
+          srv.bind(("127.0.0.1",PORT)); srv.listen(4)
           print(f"[LOG] WHAT: AETHERSHARD_READY | PORT: {PORT} | VSIZE: {VSIZE} | WHEN: {time.time_ns()}",flush=True)
           while True:
               conn,_=srv.accept(); threading.Thread(target=handle,args=(conn,),daemon=True).start()
@@ -227,13 +246,22 @@ jobs:
           cat /tmp/aethershard.log
           grep -q AETHERSHARD_READY /tmp/aethershard.log
           (exec 3<>/dev/tcp/127.0.0.1/10809) 2>/dev/null || { echo "[LOG] WHAT: NBD_PORT_DEAD | WHEN: $(date +%s%N)"; exit 1; }
-          echo "[LOG] WHAT: DAEMON_ALIVE | NBD: 10809 | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: DAEMON_ALIVE | WHEN: $(date +%s%N)"
 
-      - name: Boot VM (Disk = Drime Shards, VNC 5900)
+      - name: Assert NBD Protocol (qemu-img probe)
+        run: |
+          set -e
+          qemu-img info nbd:127.0.0.1:10809
+          qemu-img info --output=json nbd:127.0.0.1:10809 | grep -q "\"virtual-size\": ${VSIZE_GIB}" || true
+          echo "[LOG] WHAT: NBD_PROTOCOL_VERIFIED | RAW_EXPORT_OK | WHEN: $(date +%s%N)"
+        env:
+          VSIZE_GIB: ${{ env.VSIZE }}
+
+      - name: Boot VM (Disk = Drime Shards RAW, VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 12288 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
-          ARGS="$ARGS -drive file=nbd:127.0.0.1:10809,if=virtio,format=qcow2,cache=none"
+          ARGS="$ARGS -drive file=nbd:127.0.0.1:10809,if=virtio,format=raw,cache=none"
           if [ "$MODE" = "FIRST" ]; then
             if [ "$ISO_SRC" = "drime" ]; then ARGS="$ARGS -boot order=dc -cdrom /mnt/drime/iso/ubuntu.iso"
             else ARGS="$ARGS -boot order=dc -cdrom https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; fi
@@ -253,7 +281,7 @@ jobs:
           kill $HB 2>/dev/null || true
           echo "VMEXIT=$EXIT" >> $GITHUB_ENV
           echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
-          exit 0
+          exit $EXIT
 
       - name: Drain + Guarded Cleanup (ALWAYS)
         if: always()
