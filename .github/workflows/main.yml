@@ -1,4 +1,4 @@
-name: AetherGrid AIO (v41 Handle Folder Exists)
+name: AetherGrid AIO (Flat v42)
 
 on:
   push:
@@ -18,9 +18,6 @@ jobs:
       FORCE: "true"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Install Minimal Stack
         run: |
           set -e
@@ -38,26 +35,23 @@ jobs:
           sleep 15
           echo "[LOG] WHAT: NETBIRD_UP | WHEN: $(date +%s%N)"
 
-      - name: Write Pure AetherGrid v41 (Handle 422 Already Exists)
+      - name: Write AetherGrid v42 (Flat, Instant-Durable)
         run: |
-          cat > /tmp/pure_aethergrid.py <<'PYEOF'
-          import os,sys,stat,errno,zlib,json,threading,time,signal,traceback
+          cat > /tmp/aethergrid.py <<'PYEOF'
+          import os,stat,errno,zlib,json,threading,time,signal,traceback
           from collections import OrderedDict
           from concurrent.futures import ThreadPoolExecutor
           import requests
           from fuse import FUSE, FuseOSError, Operations
-          
-          TOKENS=[os.environ["DRIME"]]+[os.environ[k] for k in ["DRIME1","DRIME2","DRIME3"] if os.environ.get(k)]
-          TOKEN=TOKENS[0]
+          TOKEN=os.environ["DRIME"]
           VSIZE=int(os.environ.get("VSIZE","18"))*1024**3
           FORCE=os.environ.get("FORCE","true")=="true"
           MNT="/mnt/aether"; API="https://app.drime.cloud/api/v1"; BASE="https://app.drime.cloud/"
-          SLOT=256*1024; PART=5*1024*1024; SEGLRU_MAX=64; COMMIT_WINDOW=2.0
+          SLOT=256*1024; PART=5*1024*1024; SEGLRU_MAX=64; CKPT_EVERY=2.0
           S=requests.Session(); S.headers.update({"Authorization":"Bearer "+TOKEN,"Accept":"application/json"})
           pool=ThreadPoolExecutor(8)
           lock=threading.Lock(); commit_req=threading.Event(); commit_done=threading.Event()
-          index={}; buf={}; segseq=[0]; idxseq=[0]; seglru=OrderedDict(); segurl={}
-          
+          index={}; buf={}; segseq=[0]; idxseq=[0]; seglru=OrderedDict(); segurl={}; last_ckpt=[0.0]
           def log(w,v): print(f"[LOG] WHAT: {w} | {v} | WHEN: {time.time_ns()}",flush=True)
           def walk(o):
               st=[o]
@@ -83,118 +77,67 @@ jobs:
                   for kk,vv in d.items():
                       if isinstance(vv,str) and ("url" in kk.lower() or kk.lower()=="link") and (vv.startswith("/") or vv.startswith("http")): return vv
               return None
-          def list_dir(fid):
+          def list_root():
               out=[]; page=1
               while True:
-                  r=S.get(API+"/drive/file-entries",params={"folderId":fid,"perPage":200,"page":page},timeout=60)
-                  r.raise_for_status(); j=r.json()
-                  items=find_items(j); out+=items
-                  log("LIST_DIR_PAGE", f"fid:{fid} page:{page} items:{len(items)}")
+                  r=S.get(API+"/drive/file-entries",params={"perPage":200,"page":page},timeout=60)
+                  r.raise_for_status(); items=find_items(r.json()); out+=items
                   if len(items)<200: break
                   page+=1
               return out
           def get_file_url(fid):
-              r=S.get(API+f"/file-entries/{fid}",timeout=60)
-              r.raise_for_status(); j=r.json()
-              return digurl(j)
-          FOLDERS={}
-          def folder(path):
-              if path in FOLDERS: return FOLDERS[path]
-              parts=path.split("/")
-              cur=""
-              for i,leaf in enumerate(parts):
-                  key="/".join(parts[:i+1])
-                  if key in FOLDERS: cur=FOLDERS[key]; continue
-                  items=[it for it in list_dir(cur) if it.get("name")==leaf]
-                  if items:
-                      cur=str(items[0]["id"])
-                      log("FOLDER_EXISTS", f"path:{key} id:{cur}")
-                  else:
-                      payload={"name":leaf,"parent_id":int(cur) if cur else None}
-                      log("FOLDER_CREATE_REQ", json.dumps(payload))
-                      r=S.post(API+"/folders",json=payload,timeout=60)
-                      log("FOLDER_CREATE_RESP", f"status:{r.status_code} body:{r.text[:300]}")
-                      if r.status_code==422 and "already exists" in r.text:
-                          log("FOLDER_ALREADY_EXISTS_RELIST", f"re-listing parent to find {leaf}")
-                          items=[it for it in list_dir(cur) if it.get("name")==leaf]
-                          if items:
-                              cur=str(items[0]["id"])
-                              log("FOLDER_FOUND_ON_RELIST", f"path:{key} id:{cur}")
-                          else:
-                              raise RuntimeError(f"Folder {leaf} reported as exists but not found on re-list")
-                      else:
-                          r.raise_for_status()
-                          j=r.json()
-                          cur=str(dig(j,"id"))
-                          log("FOLDER_CREATED", f"path:{key} id:{cur}")
-                  FOLDERS[key]=cur
-              FOLDERS[path]=cur; return cur
-          def mp_create(fname,parent):
-              r=S.post(API+"/s3/multipart/create",json={"Filename":fname,"Mime":"application/octet-stream","Size":0,"Extension":"bin","ParentID":int(parent),"RelativePath":fname,"WorkspaceID":0},timeout=60)
-              r.raise_for_status(); j=r.json()
+              r=S.get(API+f"/file-entries/{fid}",timeout=60); r.raise_for_status()
+              return digurl(r.json())
+          def mp_create(fname):
+              bodies=[{"Filename":fname,"Mime":"application/octet-stream","Size":0,"Extension":"bin","RelativePath":fname},
+                      {"Filename":fname,"Mime":"application/octet-stream","Size":0,"Extension":"bin","RelativePath":fname,"ParentID":None},
+                      {"Filename":fname,"Mime":"application/octet-stream","Size":0,"Extension":"bin","RelativePath":fname,"ParentID":0}]
+              last=None
+              for b in bodies:
+                  r=S.post(API+"/s3/multipart/create",json=b,timeout=60); last=r
+                  if r.status_code in (200,201): break
+              last.raise_for_status(); j=last.json()
               return str(dig(j,"uploadid","upload_id")), str(dig(j,"key"))
           def mp_sign(up,key,nums):
               r=S.post(API+"/s3/multipart/batch-sign-part-urls",json={"UploadID":up,"Key":key,"PartNumbers":nums},timeout=60)
-              r.raise_for_status(); j=r.json()
-              m={}
-              for d in walk(j):
+              r.raise_for_status(); m={}
+              for d in walk(r.json()):
                   pn=None; url=None
                   for k,v in d.items():
                       if isinstance(v,int) and "part" in k.lower(): pn=v
                       if isinstance(v,str) and v.startswith("http"): url=v
                   if pn is not None and url: m[pn]=url
               return m
-          def mp_put(url,data):
-              r=requests.put(url,data=data,headers={"Content-Type":"application/octet-stream"},timeout=120)
-              r.raise_for_status(); return r.headers.get("ETag","")
           def mp_complete(up,key,parts):
               r=S.post(API+"/s3/multipart/complete",json={"UploadID":up,"Key":key,"Parts":parts},timeout=120)
-              r.raise_for_status(); j=r.json()
-              return digurl(j)
-          def upload_blob(name,data,parent):
-              up,key=mp_create(name,parent)
-              nparts=max(1,(len(data)+PART-1)//PART)
-              urls=mp_sign(up,key,list(range(1,nparts+1)))
-              parts=[]
+              r.raise_for_status(); return digurl(r.json())
+          def upload_blob(name,data):
+              up,key=mp_create(name)
+              n=max(1,(len(data)+PART-1)//PART)
+              urls=mp_sign(up,key,list(range(1,n+1)))
               def do(pn):
-                  chunk=data[(pn-1)*PART:pn*PART]
-                  et=mp_put(urls[pn],chunk)
-                  return {"PartNumber":pn,"ETag":et}
-              futs=[pool.submit(do,pn) for pn in range(1,nparts+1)]
-              for f in futs: parts.append(f.result())
-              parts.sort(key=lambda p:p["PartNumber"])
+                  r=requests.put(urls[pn],data=data[(pn-1)*PART:pn*PART],headers={"Content-Type":"application/octet-stream"},timeout=120)
+                  r.raise_for_status(); return {"PartNumber":pn,"ETag":r.headers.get("ETag","")}
+              futs=[pool.submit(do,pn) for pn in range(1,n+1)]
+              parts=sorted((f.result() for f in futs),key=lambda p:p["PartNumber"])
               return mp_complete(up,key,parts)
-          def delete_file(fid):
+          def hard_delete(fid):
               r=S.post(API+"/file-entries/delete",json={"EntryIDs":[str(fid)],"DeleteForever":True},timeout=60)
-              r.raise_for_status()
-          def purge(path):
-              fid=folder(path)
-              for it in list_dir(fid):
-                  delete_file(it["id"])
-          def load_head():
-              fid=folder("lob/idx")
-              names=sorted(i["name"] for i in list_dir(fid))
-              if not names: 
-                  log("HEAD_LOADED", "EMPTY"); 
-                  return
-              idxseq[0]=int(names[-1].split(".")[0]) if names[-1].split(".")[0].isdigit() else 0
-              it=[i for i in list_dir(fid) if i["name"]==names[-1]][0]
-              u=it.get("url") or digurl(it)
-              if not u:
-                  u=get_file_url(it["id"])
-              if not u:
-                  log("HEAD_URL_MISSING", "treating as empty disk"); return
-              r=S.get(BASE+u if u.startswith("/") else u,timeout=120); r.raise_for_status()
-              d=json.loads(zlib.decompress(r.content))
-              index.update(d["index"]); segseq[0]=d.get("segseq",0)
-              for k,v in d.get("segurls",{}).items(): segurl[k]=v
-              log("HEAD_LOADED", f"IDX:{idxseq[0]} SEG:{segseq[0]} SLOTS:{len(index)}")
+              return r.status_code
+          def wipe():
+              n=0
+              for it in list_root():
+                  nm=it.get("name","")
+                  if nm.startswith("aeg-"):
+                      hard_delete(it["id"]); n+=1
+              log("WIPE", f"deleted {n} old objects")
           def checkpoint():
               with lock:
                   idxseq[0]+=1; s=idxseq[0]
                   snap={"index":dict(index),"segseq":segseq[0],"segurls":dict(segurl)}
               rawb=zlib.compress(json.dumps(snap).encode(),6)
-              upload_blob(f"{s:010d}.idx",rawb,folder("lob/idx"))
+              upload_blob(f"aeg-i{s:08d}.idx",rawb)
+              last_ckpt[0]=time.time()
           def commit():
               with lock:
                   slots=list(buf.keys())
@@ -203,51 +146,77 @@ jobs:
                   for s in slots:
                       c=zlib.compress(bytes(buf[s]),1); table[s]=[off,len(c)]; chunks.append(c); off+=len(c)
                   buf.clear()
-                  segseq[0]+=1; seq=segseq[0]; name=f"seg{seq:010d}.bin"
+                  segseq[0]+=1; seq=segseq[0]
                   for s in slots: index[str(s)]=f"{seq}:{table[s][0]}:{table[s][1]}"
-              payload=b"".join(chunks)
-              u=upload_blob(name,payload,folder("lob/seg"))
+              body=json.dumps(table).encode()
+              payload=len(body).to_bytes(4,"big")+body+b"".join(chunks)
+              u=upload_blob(f"aeg-s{seq:08d}.bin",payload)
               with lock: segurl[str(seq)]=u or ""
-              checkpoint()
+              if time.time()-last_ckpt[0]>=CKPT_EVERY: checkpoint()
               return True
           def committer():
               while True:
-                  commit_req.wait(COMMIT_WINDOW)
+                  commit_req.wait(CKPT_EVERY)
                   commit_req.clear()
                   try:
-                      commit(); commit_done.set()
-                  except Exception:
-                      traceback.print_exc(); commit_done.set()
-          def drain():
+                      commit()
+                      with lock: need=len(buf)==0
+                      if time.time()-last_ckpt[0]>=CKPT_EVERY: checkpoint()
+                  except Exception: traceback.print_exc()
+                  commit_done.set()
+          def drain_sync():
               with lock: need=len(buf)>0
               if not need: return
               commit_done.clear(); commit_req.set(); commit_done.wait(120)
-          def seg_bytes(seq):
+          def seg_payload(seq):
               with lock:
                   if seq in seglru: seglru.move_to_end(seq); return seglru[seq]
                   u=segurl.get(str(seq),"")
               if not u:
-                  it=[i for i in list_dir(folder("lob/seg")) if i["name"]==f"seg{seq:010d}.bin"]
-                  if it:
-                      u=it[0].get("url") or digurl(it[0])
-                      if not u: u=get_file_url(it[0]["id"])
-                      with lock: segurl[str(seq)]=u or ""
-              if not u:
-                  log("SEG_URL_MISSING", f"seq:{seq}"); return b"\x00"*1024
+                  nm=f"aeg-s{seq:08d}.bin"
+                  it=[x for x in list_root() if x.get("name")==nm]
+                  if not it: raise FuseOSError(errno.EIO)
+                  u=it[0].get("url") or get_file_url(it[0]["id"]) or ""
+                  with lock: segurl[str(seq)]=u
               r=S.get(BASE+u if u.startswith("/") else u,timeout=120); r.raise_for_status()
               d=r.content
               with lock:
                   seglru[seq]=d; seglru.move_to_end(seq)
                   while len(seglru)>SEGLRU_MAX: seglru.popitem(last=False)
               return d
+          def parse_seg(payload):
+              ln=int.from_bytes(payload[:4],"big"); table=json.loads(payload[4:4+ln]); return table,payload[4+ln:]
+          def load_head():
+              idxs=sorted((x for x in list_root() if x.get("name","").startswith("aeg-i")),key=lambda x:x["name"])
+              if not idxs: log("HEAD_LOADED","EMPTY"); return
+              it=idxs[-1]; idxseq[0]=int(it["name"][5:13])
+              u=it.get("url") or get_file_url(it["id"])
+              r=S.get(BASE+u if u.startswith("/") else u,timeout=120); r.raise_for_status()
+              d=json.loads(zlib.decompress(r.content))
+              index.update(d["index"]); segseq[0]=d.get("segseq",0)
+              for k,v in d.get("segurls",{}).items(): segurl[k]=v
+              for x in list_root():
+                  nm=x.get("name","")
+                  if nm.startswith("aeg-s"):
+                      sq=int(nm[5:13])
+                      if sq>segseq[0]:
+                          try:
+                              uu=x.get("url") or get_file_url(x["id"])
+                              rr=S.get(BASE+uu if uu.startswith("/") else uu,timeout=120); rr.raise_for_status()
+                              table,body=parse_seg(rr.content)
+                              for s,(o,l) in table.items(): index[str(s)]=f"{sq}:{o}:{l}"
+                              with lock: segurl[str(sq)]=uu or ""
+                              segseq[0]=sq
+                          except Exception: traceback.print_exc()
+              log("HEAD_LOADED", f"IDX:{idxseq[0]} SEG:{segseq[0]} SLOTS:{len(index)}")
           def read_slot(slot):
               with lock:
                   if slot in buf: return bytes(buf[slot])
                   ptr=index.get(str(slot))
                   if ptr is None: return b"\x00"*SLOT
               seq,off,ln=map(int,ptr.split(":"))
-              pay=seg_bytes(seq)
-              return zlib.decompress(pay[off:off+ln])
+              table,body=parse_seg(seg_payload(seq))
+              return zlib.decompress(body[off:off+ln])
           def write_at(off,data):
               pos=0
               while pos<len(data):
@@ -281,50 +250,35 @@ jobs:
                   write_at(offset,bytes(data)); return len(data)
               def flush(self,path,fh): return 0
               def fsync(self,path,datasync,fh):
-                  drain(); return 0
-              def release(self,path,fh):
-                  drain(); return 0
+                  drain_sync(); return 0
+              def release(self,path,fh): return 0
               def statfs(self,path):
                   return dict(f_bsize=4096,f_frsize=4096,f_blocks=VSIZE//4096,f_bfree=0,f_bavail=0)
               def truncate(self,path,length,fh=None): return 0
           def on_term(sig,frm):
-              threading.Thread(target=lambda:(drain(),os._exit(0))).start()
+              threading.Thread(target=lambda:(commit(),os._exit(0))).start()
           signal.signal(signal.SIGTERM,on_term); signal.signal(signal.SIGINT,on_term)
-          
-          folder("lob/idx"); folder("lob/seg")
-          if FORCE:
-              purge("lob/idx"); purge("lob/seg")
-              log("SELF_HEAL", "purged lob (FORCE=true)")
+          if FORCE: wipe()
           os.makedirs(MNT,exist_ok=True)
           load_head()
           threading.Thread(target=committer,daemon=True).start()
-          log("AETHERCORE_READY", f"MNT:{MNT} VSIZE:{VSIZE} PURE:ON")
+          log("AETHERCORE_READY", f"MNT:{MNT} VSIZE:{VSIZE} FLAT:ON INSTANT_DURABLE:ON")
           FUSE(AetherFS(),MNT,foreground=True,direct_io=True,allow_other=True,nothreads=False)
           PYEOF
-          python3 -m py_compile /tmp/pure_aethergrid.py
-          echo "[LOG] WHAT: PURE_COMPILED | WHEN: $(date +%s%N)"
+          python3 -m py_compile /tmp/aethergrid.py
+          echo "[LOG] WHAT: COMPILED | WHEN: $(date +%s%N)"
 
       - name: Detect Mode
         run: |
           set -e
-          sudo env DRIME=$DRIME DRIME1=$DRIME1 DRIME2=$DRIME2 DRIME3=$DRIME3 python3 -c "
+          if [ "$FORCE" = "true" ]; then echo "MODE=FIRST" >> $GITHUB_ENV; else
+          sudo env DRIME=$DRIME python3 -c "
           import requests,os
-          T=os.environ['DRIME']
-          S=requests.Session(); S.headers.update({'Authorization':'Bearer '+T,'Accept':'application/json'})
-          API='https://app.drime.cloud/api/v1'
-          r=S.get(API+'/drive/file-entries',params={'perPage':200},timeout=60)
-          items=[i for i in r.json().get('data',[]) if i.get('name')=='lob']
-          if not items: print('MODE=FIRST')
-          else:
-              lob=str(items[0]['id'])
-              r2=S.get(API+'/drive/file-entries',params={'folderId':lob,'perPage':200},timeout=60)
-              idx=[i for i in r2.json().get('data',[]) if i.get('name')=='idx']
-              if idx:
-                  r3=S.get(API+'/drive/file-entries',params={'folderId':str(idx[0]['id']),'perPage':200},timeout=60)
-                  if r3.json().get('data'): print('MODE=BOOT')
-                  else: print('MODE=FIRST')
-              else: print('MODE=FIRST')
-          " >> $GITHUB_ENV
+          S=requests.Session(); S.headers.update({'Authorization':'Bearer '+os.environ['DRIME'],'Accept':'application/json'})
+          r=S.get('https://app.drime.cloud/api/v1/drive/file-entries',params={'perPage':200},timeout=60)
+          items=[i for i in r.json().get('data',[]) if str(i.get('name','')).startswith('aeg-i')]
+          print('MODE=BOOT' if items else 'MODE=FIRST')
+          " >> $GITHUB_ENV; fi
           echo "VSIZE=18" >> $GITHUB_ENV
 
       - name: Resolve Media
@@ -336,36 +290,33 @@ jobs:
                    "https://releases.ubuntu.com/resolute/ubuntu-26.04-live-server-amd64.iso"; do
             if curl -sfI "$u" | head -1 | grep -qE "HTTP/[^ ]+ (200|302)"; then ISO_URL=$u; break; fi
           done
-          [ -n "$ISO_URL" ] || { echo "[LOG] WHAT: MEDIA_DEAD | WHEN: $(date +%s%N)"; exit 1; }
+          [ -n "$ISO_URL" ] || exit 1
           echo "CDROM=$ISO_URL" >> $GITHUB_ENV
 
       - name: Launch AetherGrid
         run: |
           set -e
-          sudo env VSIZE=$VSIZE DRIME=$DRIME DRIME1=$DRIME1 DRIME2=$DRIME2 DRIME3=$DRIME3 FORCE=$FORCE nohup python3 /tmp/pure_aethergrid.py > /tmp/aethergrid.log 2>&1 &
+          sudo env VSIZE=$VSIZE DRIME=$DRIME FORCE=$FORCE nohup python3 /tmp/aethergrid.py > /tmp/aethergrid.log 2>&1 &
           sleep 10
           cat /tmp/aethergrid.log
           grep -q AETHERCORE_READY /tmp/aethergrid.log
           mountpoint -q /mnt/aether || exit 1
           ls -l /mnt/aether/disk.img
+          echo "[LOG] WHAT: ALIVE | WHEN: $(date +%s%N)"
 
-      - name: Boot VM
+      - name: Boot VM (VNC 5900)
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 8192 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
           ARGS="$ARGS -drive file=/mnt/aether/disk.img,if=virtio,format=raw,cache=none"
           if [ "$MODE" = "FIRST" ]; then ARGS="$ARGS -boot order=dc -cdrom $CDROM"; else ARGS="$ARGS -boot order=c"; fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
-          ( while true; do sleep 300; tail -3 /tmp/aethergrid.log; done ) &
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | WHEN: $(date +%s%N)"
+          ( while true; do sleep 300; \
+            echo "[LOG] WHAT: HEARTBEAT | WHEN: $(date +%s%N)"; free -h | head -2; \
+            tail -3 /tmp/aethergrid.log; \
+          done ) &
           sudo qemu-system-x86_64 $ARGS &
-          wait $!
-          echo "VMEXIT=$?" >> $GITHUB_ENV
-
-      - name: Drain
-        if: always()
-        run: |
-          sudo pkill -TERM -f qemu-system-x86_64 || true
-          sleep 3
-          sudo pkill -TERM -f pure_aethergrid.py || true
-          sleep 15
-          tail -30 /tmp/aethergrid.log
+          QP=$!
+          EXIT=0; wait $QP || EXIT=$?
+          echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
+          exit $EXIT
