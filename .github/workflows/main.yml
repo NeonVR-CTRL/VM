@@ -1,4 +1,4 @@
-name: AetherGrid AIO (Always Reinstall v40)
+name: AetherGrid AIO (v41 Handle Folder Exists)
 
 on:
   push:
@@ -15,13 +15,13 @@ jobs:
       DRIME1: ${{ secrets.DRIME1 }}
       DRIME2: ${{ secrets.DRIME2 }}
       DRIME3: ${{ secrets.DRIME3 }}
-      FORCE: "true"  # Always true
+      FORCE: "true"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Minimal Stack (NO rclone)
+      - name: Install Minimal Stack
         run: |
           set -e
           sudo apt-get update -y
@@ -29,8 +29,7 @@ jobs:
             qemu-system-x86 qemu-utils qemu-system-common qemu-block-extra fuse3 libfuse2 wget curl ca-certificates python3 python3-pip
           curl -fsSL https://pkgs.netbird.io/install.sh | sh
           sudo pip3 install --break-system-packages fusepy requests
-          sudo python3 -c "import fuse,requests; print('deps OK')"
-          echo "[LOG] WHAT: INSTALL_DONE | NO_RCLONE | WHEN: $(date +%s%N)"
+          echo "[LOG] WHAT: INSTALL_DONE | WHEN: $(date +%s%N)"
 
       - name: NetBird Mesh Up
         run: |
@@ -39,10 +38,10 @@ jobs:
           sleep 15
           echo "[LOG] WHAT: NETBIRD_UP | WHEN: $(date +%s%N)"
 
-      - name: Write Pure AetherGrid v40 (Fix folder-exists logic)
+      - name: Write Pure AetherGrid v41 (Handle 422 Already Exists)
         run: |
           cat > /tmp/pure_aethergrid.py <<'PYEOF'
-          import os,sys,stat,errno,zlib,json,threading,time,signal,traceback,subprocess
+          import os,sys,stat,errno,zlib,json,threading,time,signal,traceback
           from collections import OrderedDict
           from concurrent.futures import ThreadPoolExecutor
           import requests
@@ -51,7 +50,7 @@ jobs:
           TOKENS=[os.environ["DRIME"]]+[os.environ[k] for k in ["DRIME1","DRIME2","DRIME3"] if os.environ.get(k)]
           TOKEN=TOKENS[0]
           VSIZE=int(os.environ.get("VSIZE","18"))*1024**3
-          FORCE=os.environ.get("FORCE","true")=="true"  # Always true now
+          FORCE=os.environ.get("FORCE","true")=="true"
           MNT="/mnt/aether"; API="https://app.drime.cloud/api/v1"; BASE="https://app.drime.cloud/"
           SLOT=256*1024; PART=5*1024*1024; SEGLRU_MAX=64; COMMIT_WINDOW=2.0
           S=requests.Session(); S.headers.update({"Authorization":"Bearer "+TOKEN,"Accept":"application/json"})
@@ -90,6 +89,7 @@ jobs:
                   r=S.get(API+"/drive/file-entries",params={"folderId":fid,"perPage":200,"page":page},timeout=60)
                   r.raise_for_status(); j=r.json()
                   items=find_items(j); out+=items
+                  log("LIST_DIR_PAGE", f"fid:{fid} page:{page} items:{len(items)}")
                   if len(items)<200: break
                   page+=1
               return out
@@ -107,18 +107,26 @@ jobs:
                   if key in FOLDERS: cur=FOLDERS[key]; continue
                   items=[it for it in list_dir(cur) if it.get("name")==leaf]
                   if items:
-                      cur=str(items[0]["id"])  # Folder exists, use it
+                      cur=str(items[0]["id"])
                       log("FOLDER_EXISTS", f"path:{key} id:{cur}")
                   else:
-                      # Folder doesn't exist, create it
                       payload={"name":leaf,"parent_id":int(cur) if cur else None}
                       log("FOLDER_CREATE_REQ", json.dumps(payload))
                       r=S.post(API+"/folders",json=payload,timeout=60)
-                      log("FOLDER_CREATE_RESP", f"status:{r.status_code}")
-                      r.raise_for_status()
-                      j=r.json()
-                      cur=str(dig(j,"id"))
-                      log("FOLDER_CREATED", f"path:{key} id:{cur}")
+                      log("FOLDER_CREATE_RESP", f"status:{r.status_code} body:{r.text[:300]}")
+                      if r.status_code==422 and "already exists" in r.text:
+                          log("FOLDER_ALREADY_EXISTS_RELIST", f"re-listing parent to find {leaf}")
+                          items=[it for it in list_dir(cur) if it.get("name")==leaf]
+                          if items:
+                              cur=str(items[0]["id"])
+                              log("FOLDER_FOUND_ON_RELIST", f"path:{key} id:{cur}")
+                          else:
+                              raise RuntimeError(f"Folder {leaf} reported as exists but not found on re-list")
+                      else:
+                          r.raise_for_status()
+                          j=r.json()
+                          cur=str(dig(j,"id"))
+                          log("FOLDER_CREATED", f"path:{key} id:{cur}")
                   FOLDERS[key]=cur
               FOLDERS[path]=cur; return cur
           def mp_create(fname,parent):
@@ -283,7 +291,6 @@ jobs:
               threading.Thread(target=lambda:(drain(),os._exit(0))).start()
           signal.signal(signal.SIGTERM,on_term); signal.signal(signal.SIGINT,on_term)
           
-          # Control plane
           folder("lob/idx"); folder("lob/seg")
           if FORCE:
               purge("lob/idx"); purge("lob/seg")
@@ -320,7 +327,7 @@ jobs:
           " >> $GITHUB_ENV
           echo "VSIZE=18" >> $GITHUB_ENV
 
-      - name: Resolve Media (mirror)
+      - name: Resolve Media
         if: env.MODE == 'FIRST'
         run: |
           set -e
@@ -331,56 +338,34 @@ jobs:
           done
           [ -n "$ISO_URL" ] || { echo "[LOG] WHAT: MEDIA_DEAD | WHEN: $(date +%s%N)"; exit 1; }
           echo "CDROM=$ISO_URL" >> $GITHUB_ENV
-          echo "[LOG] WHAT: MEDIA_RESOLVED | SRC: mirror | WHEN: $(date +%s%N)"
 
-      - name: Launch Pure AetherGrid + Assert
+      - name: Launch AetherGrid
         run: |
           set -e
           sudo env VSIZE=$VSIZE DRIME=$DRIME DRIME1=$DRIME1 DRIME2=$DRIME2 DRIME3=$DRIME3 FORCE=$FORCE nohup python3 /tmp/pure_aethergrid.py > /tmp/aethergrid.log 2>&1 &
           sleep 10
           cat /tmp/aethergrid.log
           grep -q AETHERCORE_READY /tmp/aethergrid.log
-          mountpoint -q /mnt/aether || { echo "[LOG] WHAT: AETHER_MOUNT_DEAD | WHEN: $(date +%s%N)"; exit 1; }
+          mountpoint -q /mnt/aether || exit 1
           ls -l /mnt/aether/disk.img
-          echo "[LOG] WHAT: AETHERCORE_ALIVE | WHEN: $(date +%s%N)"
 
-      - name: Probe Disk
-        run: |
-          set -e
-          qemu-img info /mnt/aether/disk.img
-          echo "[LOG] WHAT: DISK_PROBE_VERIFIED | WHEN: $(date +%s%N)"
-
-      - name: Boot VM (LOB disk + mirror media, VNC 5900)
+      - name: Boot VM
         run: |
           if [ -e /dev/kvm ]; then ACC="-accel kvm -cpu host"; else ACC="-accel tcg -cpu max"; fi
           ARGS="-m 8192 -smp 4 $ACC -vnc 0.0.0.0:0 -display none"
           ARGS="$ARGS -drive file=/mnt/aether/disk.img,if=virtio,format=raw,cache=none"
           if [ "$MODE" = "FIRST" ]; then ARGS="$ARGS -boot order=dc -cdrom $CDROM"; else ARGS="$ARGS -boot order=c"; fi
-          echo "[LOG] WHAT: VM_START | MODE: $MODE | DISK: Pure-LOB | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
-          ( while true; do sleep 300; \
-            echo "[LOG] WHAT: HEARTBEAT | MODE: $MODE | WHEN: $(date +%s%N)"; \
-            free -h | head -2 || true; \
-            tail -5 /tmp/aethergrid.log || true; \
-          done ) &
-          HB=$!
+          echo "[LOG] WHAT: VM_START | MODE: $MODE | VNC: 0.0.0.0:5900 | WHEN: $(date +%s%N)"
+          ( while true; do sleep 300; tail -3 /tmp/aethergrid.log; done ) &
           sudo qemu-system-x86_64 $ARGS &
-          QP=$!
-          EXIT=0; wait $QP || EXIT=$?
-          kill $HB 2>/dev/null || true
-          echo "VMEXIT=$EXIT" >> $GITHUB_ENV
-          echo "[LOG] WHAT: VM_EXIT | CODE: $EXIT | WHEN: $(date +%s%N)"
-          exit $EXIT
+          wait $!
+          echo "VMEXIT=$?" >> $GITHUB_ENV
 
-      - name: Drain to Drime (Data Durability)
-        # PURPOSE: Flush any pending writes from Python memory buffer to Drime before process dies.
-        # Without this, if QEMU or daemon crashes, recent writes would be lost.
-        # The drain calls commit() which uploads dirty slots as a new segment object + updates index.
+      - name: Drain
         if: always()
         run: |
-          echo "[LOG] WHAT: DRAIN_START | PURPOSE: flush memory buffer to Drime for durability | WHEN: $(date +%s%N)"
           sudo pkill -TERM -f qemu-system-x86_64 || true
           sleep 3
           sudo pkill -TERM -f pure_aethergrid.py || true
           sleep 15
-          tail -30 /tmp/aethergrid.log || true
-          echo "[LOG] WHAT: DRAIN_DONE | ALL_WRITES_PERSISTED_TO_DRIME | WHEN: $(date +%s%N)"
+          tail -30 /tmp/aethergrid.log
